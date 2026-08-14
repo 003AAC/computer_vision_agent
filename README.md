@@ -261,9 +261,7 @@ pip install pywin32
 
 ## ⚠️ 隐私与安全
 
-- **绝不在仓库中提交** `deepseek_key.txt` 或其他明文凭据（已在 `.gitignore` 中忽略）。
-- 若历史中已泄露密钥，请使用 `git filter-repo`/BFG 清理，并到 DeepSeek 平台更换 Key。
-- 模型权重体积大，请勿提交仓库；使用 HuggingFace 下载或 LFS 管理。
+- 不要在文件里提交自己的密钥 `deepseek_key.txt` 或其他明文凭据。
 - 本项目会**控制你的鼠标键盘**，请勿在无人值守时运行危险任务；运行前确保已备份重要文件。
 
 ---
