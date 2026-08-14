@@ -1,0 +1,55 @@
+{
+  "UnicodeDecodeError": {
+    "category": "编码问题",
+    "cause": "文件编码与默认编码不匹配",
+    "actions": [
+      "设置环境变量 PYTHONUTF8=1",
+      "改用 GUI 方式输入中文（type_text 工具）",
+      "指定文件编码：open(file, encoding='utf-8')"
+    ]
+  },
+  "UnicodeEncodeError": {
+    "category": "编码问题",
+    "cause": "API Key 或参数包含中文字符",
+    "actions": [
+      "检查 API Key 是否为纯 ASCII",
+      "替换占位符为真实值"
+    ]
+  },
+  "Permission denied": {
+    "category": "权限问题",
+    "cause": "没有足够的权限执行操作",
+    "actions": [
+      "以管理员身份运行",
+      "检查文件是否被其他程序占用",
+      "检查文件是否为只读"
+    ]
+  },
+  "拒绝访问": {
+    "category": "权限问题",
+    "cause": "Windows 权限限制",
+    "actions": [
+      "右键以管理员身份运行",
+      "检查 UAC 设置",
+      "检查文件所有者"
+    ]
+  },
+  "ModuleNotFoundError": {
+    "category": "依赖问题",
+    "cause": "缺少 Python 包",
+    "actions": [
+      "pip install 包名",
+      "检查是否在正确的虚拟环境中",
+      "检查 Python 版本是否兼容"
+    ]
+  },
+  "FileNotFoundError": {
+    "category": "路径问题",
+    "cause": "文件或路径不存在",
+    "actions": [
+      "检查路径是否正确",
+      "用 dir 命令确认文件是否存在",
+      "检查是否有拼写错误"
+    ]
+  }
+}

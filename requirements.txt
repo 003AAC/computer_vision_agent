@@ -1,0 +1,26 @@
+# Computer Use Agent 依赖
+# 建议 Python 3.10+
+
+# === 主脑（DeepSeek API）===
+openai>=1.0.0
+
+# === Agent 框架 ===
+langchain-core>=0.1.0
+
+# === 桌面控制 ===
+pyautogui
+pyperclip
+pywin32          # Win32 API 鼠标/键盘（Windows）
+
+# === 视觉模型（本地）===
+torch            # CPU 可跑；GPU 环境建议安装对应 CUDA 版本
+transformers>=4.40.0
+pillow
+numpy
+
+# === OCR ===
+easyocr          # 自动含 torch/numpy 依赖
+
+# === 可选：类别判断（CLIP，缺失时自动回退 Florence-2）===
+# 如需使用 CLIP 请额外安装:
+# pip install "git+https://github.com/openai/CLIP.git"  （或 transformers 内置 CLIPModel）

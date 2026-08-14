@@ -1,0 +1,20 @@
+{
+  "user_name": "华硕",
+  "desktop_path": "C:\\Users\\华硕\\Desktop",
+  "documents_path": "C:\\Users\\华硕\\Documents",
+  "downloads_path": "C:\\Users\\华硕\\Downloads",
+  "screen_resolution": "1920x1080",
+  "python_path": "F:\\tools\\python.exe",
+  "python_version": "3.11",
+  "installed_apps": {
+    "记事本": "notepad",
+    "WPS Office": "wps",
+    "VS Code": "code",
+    "Chrome": "chrome",
+    "Git": "git"
+  },
+  "common_paths": {
+    "transformer_project": "F:\\transformer",
+    "tools_directory": "F:\\tools"
+  }
+}

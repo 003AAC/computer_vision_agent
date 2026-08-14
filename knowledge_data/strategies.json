@@ -1,0 +1,40 @@
+{
+  "创建文件": {
+    "best": "run_command",
+    "command": "echo. > \"{desktop_path}\\{filename}\"",
+    "alternative": "GUI右键新建（不推荐，容易失败）",
+    "warning": "不要用 echo 写中文，会乱码"
+  },
+  "启动应用": {
+    "best": "run_command",
+    "command": "start {app_name}",
+    "alternative": "Win键搜索→Enter",
+    "warning": "应用名要准确，可以用 where 命令确认路径"
+  },
+  "打开记事本": {
+    "best": "run_command",
+    "command": "start notepad",
+    "alternative": "Win键搜索→输入'记事本'→Enter",
+    "steps": [
+      "Win键",
+      "type_text '记事本'",
+      "press_key enter"
+    ]
+  },
+  "保存文件": {
+    "best": "hotkey",
+    "keys": [
+      "ctrl",
+      "s"
+    ],
+    "warning": "第一次保存会弹出对话框，需要输入文件名和路径"
+  },
+  "关闭窗口": {
+    "best": "hotkey",
+    "keys": [
+      "alt",
+      "f4"
+    ],
+    "warning": "会提示是否保存未保存的内容"
+  }
+}
