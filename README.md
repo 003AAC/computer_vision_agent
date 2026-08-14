@@ -68,7 +68,7 @@ vision agent/
 ### 1. 克隆仓库
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/003AAC/computer_vision_agent.git
 cd "vision agent"
 ```
 
