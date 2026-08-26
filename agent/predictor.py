@@ -67,6 +67,9 @@ class ActionPredictor:
 
     # 等待观察轮询间隔（秒）
     POLL_INTERVAL = 0.5
+    # 最大观察次数（CPU 全屏 OCR 每次 2-5s，限制重扫次数防刷屏/拖慢）
+    # 首次观察 + 退避重扫：0.5s→1s→2s→4s→8s 覆盖约 15s 窗口
+    MAX_OBSERVATIONS = 6
     # 最大预测数量（短期内只保留最近的活动预测）
     MAX_PREDICTIONS = 3
 
@@ -151,13 +154,16 @@ class ActionPredictor:
         """等待并观察，直到预测条件满足或超时
 
         流程：
-          1. 每隔 poll_interval 秒观察一次
-          2. 每次检查应出现的元素是否出现
+          1. 首次观察（OCR 获取屏幕文字）
+          2. 若未命中，退避重扫（0.5s→1s→2s→4s，最多 MAX_OBSERVATIONS 次）
           3. 出现 → 预测通过；超时 → 预测失败
+
+        ⚠️ 性能优化：不再每 poll_interval 全屏 OCR 轮询（CPU 每次 2-5s，
+        会刷屏 + 拖慢节奏）。改为指数退避 + 观察次数上限。
 
         Args:
             pred: 预测对象
-            poll_interval: 轮询间隔（默认 0.5s）
+            poll_interval: 轮询间隔（已废弃，改用退避）
             ocr_texts: 可注入首次观察结果
 
         Returns:
@@ -169,7 +175,6 @@ class ActionPredictor:
               "observation_count": int
             }
         """
-        poll_interval = poll_interval or self.POLL_INTERVAL
         deadline = pred.timestamp + pred.timeout
         should_appear = pred.should_appear or []
 
@@ -184,9 +189,12 @@ class ActionPredictor:
             observation_count += 1
             found, missed = self._split_matches(should_appear, first_obs)
 
-        # 轮询直到超时
-        while missed and time.time() < deadline:
-            time.sleep(poll_interval)
+        # 退避重扫（最多 MAX_OBSERVATIONS 次全屏 OCR，避免 CPU 无限刷屏）
+        backoff = 0.5
+        while missed and time.time() < deadline \
+                and observation_count < self.MAX_OBSERVATIONS:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 4.0)
             obs = self.observe()
             observation_count += 1
             if obs:

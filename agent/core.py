@@ -164,9 +164,12 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
 
 ## 要求
 1. phases 覆盖任务的主要阶段（3-6 个），从初始状态到完成。
-2. entry_conditions 是**屏幕证据**（OCR 能识别的文字或视觉元素），不是动作。
+2. entry_conditions 是**屏幕真实会出现的文字**（如 "开始游戏"、"Play"、"单人游戏"、"确定"、应用标题栏文字），
+   必须能被 OCR 直接识别到的实际屏幕文字。**禁止使用抽象概念描述**（如 "桌面图标"、"游戏主菜单"、"界面已打开"），
+   因为 OCR 无法匹配这些抽象词。若某阶段确实无文字证据，请写该阶段窗口/按钮上的具体文字。
 3. allowed_actions 从这些工具中选择：visual_scan, visual_scan_region, visual_scan_grid, visual_locate, visual_locate_region, visual_read_text, visual_read_region, visual_find_text, click_at, drag_mouse, type_text, press_key, hotkey, run_powershell, wait
 4. goal-spec 的 evidence 是可独立验证的**屏幕特征**（用于验收，禁止依赖执行过程）。
+   evidence 同样必须是**屏幕真实文字**（如 "开始游戏"、"Play"、游戏标题文字），禁止抽象描述。
 5. 只输出 <plan> 和 <goal> 块，不要其他解释文字。
 """
 
@@ -479,6 +482,36 @@ def _run_prediction_closure(
     should_appear = predict_data.get("should_appear", [])
     timeout = float(predict_data.get("timeout", 3.0))
 
+    # 过滤抽象描述（OCR 无法匹配的"概念词"），避免无意义空等 25s
+    # 例: "桌面图标"、"游戏主菜单"、"界面已打开" —— 屏幕不会显示这些字
+    # ⚠️ 注意：不能粗暴过滤短词（如 "游戏"），因为 "开始游戏"/"单人游戏"
+    # 是真实按钮文字。这里用"组合抽象词"精确匹配，避免误伤真实 UI 文字。
+    _ABSTRACT_TERMS = [
+        # 组合抽象描述（屏幕不会直接显示这些字）
+        "桌面图标", "游戏主菜单", "主菜单", "游戏界面", "游戏加载界面",
+        "加载界面", "登录界面", "主界面", "进入游戏", "游戏菜单",
+        "等待加载", "加载完成", "已进入", "已启动", "已打开", "加载中",
+        "界面已", "窗口出现", "游戏窗口", "游戏启动",
+    ]
+    # 仅当整词就是这些短抽象词时才过滤（"游戏"单独出现是抽象，"开始游戏"不是）
+    _ABSTRACT_EXACT = {"桌面", "图标", "界面", "主菜单", "游戏", "窗口",
+                       "按钮", "元素", "状态", "icon", "desktop", "menu",
+                       "screen", "app", "出现", "打开"}
+    filtered_appear = []
+    for item in (should_appear or []):
+        s = str(item).strip()
+        if not s:
+            continue
+        # 判断是否抽象描述：
+        #   1. 命中组合抽象词（"游戏加载界面"、"桌面图标"等）
+        #   2. 整词就是短抽象词（"游戏"、"界面"等单独出现）
+        is_abstract = any(term in s for term in _ABSTRACT_TERMS)
+        if not is_abstract and s in _ABSTRACT_EXACT:
+            is_abstract = True
+        if not is_abstract:
+            filtered_appear.append(s)
+    should_appear = filtered_appear
+
     # 建立预测
     pred = predictor.predict(
         action=tool_name,
@@ -500,6 +533,7 @@ def _run_prediction_closure(
           f"(应出现: {', '.join(should_appear) or '无'})")
 
     # 预测有 should_appear → 等待并观察
+    # 若无有效期望（全被抽象过滤），跳过观察避免空等
     observed_texts = []
     wait_result = None
     if should_appear:
@@ -508,6 +542,13 @@ def _run_prediction_closure(
         print(f"  [观察] 匹配={wait_result.get('found', [])} "
               f"未匹配={wait_result.get('missed', [])} "
               f"耗时={wait_result.get('elapsed', 0)}s")
+    else:
+        # 无有效期望 → 视为观察通过（不阻塞）
+        wait_result = {
+            "matched": True, "found": [], "missed": [],
+            "elapsed": 0.0, "observation_count": 0,
+        }
+        observed_texts = []
 
     # 对比预测 vs 观察（含阶段匹配）
     compare_result = predictor.compare(pred, observed_phase=task_phase.current_phase)
@@ -785,6 +826,13 @@ def run_task(client, tools_schema, user_query: str):
                 result_str = str(tool_result)
                 display = result_str[:200] + "..." if len(result_str) > 200 else result_str
                 print(f"  <- {display}")
+
+                # ⚡ 结构化日志：记录工具调用明细（此前缺失，导致 JSONL 无执行轨迹）
+                try:
+                    exec_logger.log_action(tool_name, tool_args, result_str,
+                                           success=not exception_handler.is_success(result_str))
+                except Exception:
+                    pass
 
                 # ⚡ 工作记忆：记录动作（动作前更新 last_action）
                 working_memory.record_action(tool_name, tool_args)

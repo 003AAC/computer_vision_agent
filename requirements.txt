@@ -11,6 +11,7 @@ langchain-core>=0.1.0
 pyautogui
 pyperclip
 pywin32          # Win32 API 鼠标/键盘（Windows）
+pywinauto        # UI Automation：精确读取桌面图标名称与坐标（桌面图标定位核心）
 
 # === 视觉模型（本地）===
 torch            # CPU 可跑；GPU 环境建议安装对应 CUDA 版本

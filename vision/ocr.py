@@ -10,6 +10,7 @@ EasyOCR 返回格式：每个元素 (bbox, text, confidence)
 import json
 import logging
 import re
+import warnings
 from typing import Dict, Any, List, Optional
 
 import pyautogui
@@ -17,6 +18,19 @@ import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# ⚡ 抑制 EasyOCR 的 pin_memory 警告刷屏
+#   EasyOCR 每次 readtext() 会创建 DataLoader(..., pin_memory=True)，
+#   在 CPU-only 环境每次迭代都打印 "no accelerator is found" 警告。
+#   预测观察轮询时每分钟刷屏几十条，严重淹没有效日志。这里静默它。
+warnings.filterwarnings(
+    "ignore",
+    message=".*pin_memory.*argument is set as true.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*no accelerator is found.*",
+)
 
 # ============================================================
 # EasyOCR 单例（懒加载，常驻内存）
@@ -166,35 +180,53 @@ def ocr_region(x: int, y: int, width: int, height: int) -> str:
 
 def find_text_on_screen(target_text: str) -> Dict[str, Any]:
     """在屏幕上查找指定文字，返回精确坐标
-    
-    先用 OCR 读所有文字，再在结果中搜索目标文字（三级匹配：精确→包含→模糊）。
-    这是定位"确定按钮"、"保存"、"文件菜单"等文字型元素的最可靠方式。
-    
+
+    先用 OCR 读所有文字，再在结果中搜索目标文字。
+    匹配策略（逐级降级）：
+      1. 精确匹配（完全相同）
+      2. 包含匹配（互为子串）
+      3. 模糊匹配（去空格标点后比较）
+      4. token 级匹配（目标拆词，OCR 碎片含多数关键词即匹配——容忍 EasyOCR 识别碎片）
+
+    若多级匹配有多个候选，取坐标最接近屏幕中心的（减少误点边缘）。
+
     Args:
-        target_text: 要查找的文字（如 "确定"、"保存"、"开始"）
-    
+        target_text: 要查找的文字（如 "确定"、"保存"、"Hearts of Iron"）
+
     Returns:
-        {"found": bool, "text": str, "x": int, "y": int, "match": str, ...}
+        {"found": bool, "text": str, "x": int, "y": int, "match": str,
+         "candidates": [...], ...}
     """
     try:
         screenshot = pyautogui.screenshot()
         texts = _ocr_image(screenshot)
 
-        # Level 1: 精确匹配
-        for t in texts:
-            if t["text"] == target_text:
-                return {"found": True, "text": t["text"], "x": t["cx"], "y": t["cy"],
-                        "bbox": [t["x"], t["y"], t["x"] + t["w"], t["y"] + t["h"]],
-                        "confidence": t["confidence"],
-                        "match": "exact"}
+        def _make(t, match, score_extra=0.0):
+            return {"found": True, "text": t["text"], "x": t["cx"], "y": t["cy"],
+                    "bbox": [t["x"], t["y"], t["x"] + t["w"], t["y"] + t["h"]],
+                    "confidence": t["confidence"], "match": match,
+                    "score": round(min(1.0, t["confidence"] + score_extra), 3)}
+
+        # Level 1: 精确匹配（最可靠：图标名/按钮文字通常是短文本）
+        exact_matches = [t for t in texts if t["text"] == target_text]
+        if exact_matches:
+            return _make(exact_matches[0], "exact", 0.3)
 
         # Level 2: 包含匹配
+        #   ⚠️ 关键：目标文字出现在长文本中（如 "帮我打开桌面的原神"）很可能是
+        #   终端命令/窗口标题/界面文字，不是可点击的图标名。真正的图标名通常短（2-6 字）。
+        #   因此按"文本块长度"排序：越短越可能是图标名，优先返回。
+        contains_matches = []
         for t in texts:
             if target_text in t["text"] or t["text"] in target_text:
-                return {"found": True, "text": t["text"], "x": t["cx"], "y": t["cy"],
-                        "bbox": [t["x"], t["y"], t["x"] + t["w"], t["y"] + t["h"]],
-                        "confidence": t["confidence"],
-                        "match": "partial"}
+                # 短文本块（<= 8 字符）= 极可能是图标名 → 高优先级
+                # 长文本块 = 命令回显/界面句子 → 低优先级
+                if len(t["text"]) <= 8:
+                    return _make(t, "partial", 0.25)
+                contains_matches.append(t)
+        if contains_matches:
+            # 长文本候选：全部返回，让调用方/LLM 判断是否可信
+            return _make(contains_matches[0], "partial", 0.0)
 
         # Level 3: 模糊匹配（去空格标点后比较）
         target_clean = re.sub(r'[\s.…,，。！？、]', '', target_text)
@@ -202,10 +234,29 @@ def find_text_on_screen(target_text: str) -> Dict[str, Any]:
             text_clean = re.sub(r'[\s.…,，。！？、]', '', t["text"])
             if len(target_clean) >= 2 and len(text_clean) >= 2:
                 if target_clean in text_clean or text_clean in target_clean:
-                    return {"found": True, "text": t["text"], "x": t["cx"], "y": t["cy"],
-                            "bbox": [t["x"], t["y"], t["x"] + t["w"], t["y"] + t["h"]],
-                            "confidence": t["confidence"],
-                            "match": "fuzzy"}
+                    return _make(t, "fuzzy")
+
+        # Level 4: token 级匹配（容忍 OCR 碎片）
+        #   目标拆成词（如 "Hearts of Iron" → ["hearts", "of", "iron"]）
+        #   对每个 OCR 文字块，统计命中关键词数；>= 最小命中数即视为候选。
+        target_words = [
+            w for w in re.split(r'[\s.…,，。！？、]+', target_text.lower())
+            if len(w) >= 2
+        ]
+        if target_words:
+            candidates = []
+            min_hits = 1 if len(target_words) >= 2 else 1
+            for t in texts:
+                t_low = t["text"].lower()
+                hits = sum(1 for w in target_words if w in t_low)
+                if hits >= min_hits:
+                    # 评分：命中数/词数 + 置信度
+                    score = (hits / len(target_words)) * 0.7 + t["confidence"] * 0.3
+                    candidates.append((score, t))
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                best_score, best_t = candidates[0]
+                return _make(best_t, "token")
 
         return {"found": False, "text": target_text, "x": 0, "y": 0,
                 "bbox": [0, 0, 0, 0], "match": "none",
@@ -214,3 +265,79 @@ def find_text_on_screen(target_text: str) -> Dict[str, Any]:
         logger.error(f"OCR 查找失败: {e}")
         return {"found": False, "text": target_text, "x": 0, "y": 0,
                 "bbox": [0, 0, 0, 0], "match": "error", "error": str(e)}
+
+
+def find_text_candidates(target_text: str, limit: int = 5) -> Dict[str, Any]:
+    """在屏幕上查找目标文字，返回全部候选坐标（按匹配分排序）
+
+    与 find_text_on_screen 的区别：
+      - 不匹配失败就返回，而是返回所有命中候选（含 token 级碎片命中）
+      - 供 OCR 引导定位：即使内容识别有误（如 "Hearts ot"），位置仍是可靠锚点
+
+    Args:
+        target_text: 要查找的文字
+        limit: 最多返回候选数
+
+    Returns:
+        {"found": bool, "candidates": [{"text", "x", "y", "cx", "cy", "bbox", "confidence", "score", "match"}]}
+    """
+    try:
+        screenshot = pyautogui.screenshot()
+        texts = _ocr_image(screenshot)
+        target_low = target_text.lower()
+        target_clean = re.sub(r'[\s.…,，。！？、]', '', target_low)
+        target_words = [
+            w for w in re.split(r'[\s.…,，。！？、]+', target_low)
+            if len(w) >= 2
+        ]
+
+        scored = []
+        for t in texts:
+            t_low = t["text"].lower()
+            t_clean = re.sub(r'[\s.…,，。！？、]', '', t_low)
+            score = 0.0
+            match = ""
+
+            if t_low == target_low:
+                score, match = 1.0, "exact"
+            elif target_low in t_low or t_low in target_low:
+                score, match = 0.9, "partial"
+            elif target_clean and t_clean and (
+                    target_clean in t_clean or t_clean in target_clean):
+                score, match = 0.8, "fuzzy"
+            elif target_words:
+                hits = sum(1 for w in target_words if w in t_low)
+                if hits >= 1:
+                    score = (hits / len(target_words)) * 0.7
+                    match = "token"
+
+            if score > 0:
+                # 置信度加成（位置锚点不要求内容高置信）
+                conf = t.get("confidence", 0.0)
+                final = score * 0.8 + conf * 0.2
+                # ⚠️ 短文本（图标名）优先：长句子很可能是终端命令/窗口标题
+                #    图标名通常 2-8 字符，命令回显通常 > 12 字符
+                text_len = len(t["text"])
+                if text_len <= 8:
+                    final += 0.15          # 短文本强加分（图标名特征）
+                elif text_len >= 15:
+                    final -= 0.15          # 长文本降权（命令回显特征）
+                # 无空格长文本（连续字符）更可能是图标名；含中文句子的长文本更像命令
+                if text_len <= 8:
+                    final += 0.10
+                scored.append({
+                    "text": t["text"], "x": t["x"], "y": t["y"],
+                    "cx": t["cx"], "cy": t["cy"],
+                    "bbox": [t["x"], t["y"], t["x"] + t["w"], t["y"] + t["h"]],
+                    "confidence": conf, "score": round(final, 3), "match": match,
+                })
+
+        scored.sort(key=lambda c: c["score"], reverse=True)
+        return {
+            "found": bool(scored),
+            "candidates": scored[:limit],
+            "total_candidates": len(scored),
+        }
+    except Exception as e:
+        logger.error(f"OCR 候选查找失败: {e}")
+        return {"found": False, "candidates": [], "error": str(e)}

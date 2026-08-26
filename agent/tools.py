@@ -382,6 +382,19 @@ def visual_locate(target_description: str) -> str:
 
     ⚠️ 复杂语义描述（如"游戏里的NPC上司"）建议改用 visual_scan() 先理解场景，再用 visual_locate_region() 在候选区域定位。"""
     try:
+        # 优先：UI Automation 桌面图标定位（对图标名最可靠，不受壁纸/OCR影响）
+        # 桌面图标是常见目标（"原神"、"Hearts of Iron"、"微信"），直接系统级精确查找
+        try:
+            from system.desktop_icons import find_desktop_icon
+            uia = find_desktop_icon(target_description)
+            if uia.get("found"):
+                return (
+                    f"✅ 桌面图标[{uia['name']}] -> 坐标({uia['x']}, {uia['y']})，"
+                    f"方法: UI自动化，置信度: 1.00"
+                )
+        except Exception as e:
+            print(f"  [UIA] 桌面图标定位异常: {e}")
+
         # Vision Router：复杂语义 → 先给 LLM 策略提示
         strategy = suggest_detection_strategy(target_description)
         if strategy.get("strategy") == "vlm_guided":
@@ -392,10 +405,24 @@ def visual_locate(target_description: str) -> str:
             )
 
         result = _tracked_locate(target_description)
-        if result.get("found"):
+        # 置信度阈值：过低视为视觉误检（复杂壁纸常产生低置信假目标）
+        if result.get("found") and result.get("confidence", 0) >= 0.35:
             return (f"✅ 找到[{target_description}] -> 坐标({result['x']}, {result['y']})，"
                     f"置信度: {result['confidence']:.2f}")
         else:
+            # OCR 引导兜底：先找文字锚点，再在附近检测图标
+            try:
+                from vision.engine import locate_icon_near_text
+                guided = locate_icon_near_text(target_description)
+                if guided.get("found"):
+                    return (
+                        f"✅ OCR引导找到[{target_description}] -> 坐标({guided['x']}, {guided['y']})，"
+                        f"方法: {guided.get('method', '')}，"
+                        f"锚点文字: {guided.get('anchor_text', '')}({guided.get('anchor_match', '')})，"
+                        f"置信度: {guided.get('confidence', 0):.2f}"
+                    )
+            except Exception as e:
+                print(f"  [OCR引导] 兜底定位异常: {e}")
             return f"❌ 未找到[{target_description}]"
     except Exception as e:
         return f"定位失败: {str(e)}"
@@ -569,16 +596,30 @@ def visual_read_region(x: int, y: int, width: int, height: int) -> str:
 @tool
 def visual_find_text(target_text: str) -> str:
     """【找文字】在屏幕上查找指定文字，返回精确点击坐标。
-    三级匹配：精确→包含→模糊，找到后直接返回可点击的坐标。
+    三级匹配：精确→包含→模糊→token，找到后直接返回可点击的坐标。
     target_text: 要查找的文字，如 "确定"、"保存"、"文件"、"开始" 等。
     返回: 找到则返回坐标(x,y)，可直接用 click_at() 点击。
-    这是点击"确定/取消/保存"等文字按钮的最可靠方式！"""
+    这是点击"确定/取消/保存"等文字按钮的最可靠方式！
+    ⚠️ 若返回的匹配文本是长句子（含命令/任务描述），说明匹配到的是窗口/终端文字而非图标名，需谨慎。"""
     try:
         result = find_text_on_screen(target_text)
         if result.get("found"):
-            return (f"✅ OCR 找到文字[{result['text']}]（{result['match']}匹配）"
-                    f" -> 坐标({result['x']}, {result['y']})，"
-                    f"可直接 click_at({result['x']}, {result['y']}) 点击")
+            matched_text = result['text']
+            match_type = result['match']
+            x, y = result['x'], result['y']
+            # 判断是否为"长文本命令回显"（很可能不是图标）
+            is_long = len(matched_text) > 10
+            # 判断是否为终端/窗口上下文（含任务描述常见词）
+            echo_like = any(w in matched_text for w in
+                            ["帮我", "打开桌面", "开始执行", "执行任务", "桌面的",
+                             "请帮我", "任务", "python", "import", "执行"])
+            note = ""
+            if is_long or echo_like:
+                note = (f" ⚠️注意：匹配到的是长文本[{matched_text[:20]}]，"
+                        f"可能是窗口/终端文字而非目标图标名，请确认该坐标是否为目标位置")
+            return (f"✅ OCR 找到文字[{matched_text}]（{match_type}匹配）"
+                    f" -> 坐标({x}, {y})，"
+                    f"可直接 click_at({x}, {y}) 点击{note}")
         else:
             hint = result.get("hint", "")
             return f"❌ OCR 未找到文字[{target_text}]。{hint}"

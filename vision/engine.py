@@ -141,7 +141,12 @@ def _is_text_dominated_scene(image: Image.Image, uniform_ratio_threshold: float 
 
 def _run_f2_base(image: Image.Image, task_prompt: str, text_input: str = None,
                   max_tokens: int = 512) -> str:
-    """Florence-2-base 推理（支持 OVD）"""
+    """Florence-2-base 推理（支持 OVD）
+
+    注意：使用 skip_special_tokens=False 解码，保留 <loc_N>/<poly> 坐标 token，
+    供 _parse_f2_ovd_tokens() 解析。文本任务（如 <CAPTION>）的输出不受影响，
+    调用方自行 strip <s>/</s> 即可。
+    """
     _load_f2_base()
     prompt = task_prompt + (text_input or "")
     inputs = _f2_base_processor(text=prompt, images=image, return_tensors="pt")
@@ -150,10 +155,212 @@ def _run_f2_base(image: Image.Image, task_prompt: str, text_input: str = None,
         pixel_values=inputs["pixel_values"],
         max_new_tokens=max_tokens, num_beams=2,
     )
-    result = _f2_base_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    result = _f2_base_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    # 去掉上下文 token，保留 <loc_N> 坐标 token
+    result = result.replace("<s>", "").replace("</s>", "").strip()
     if task_prompt in result:
         result = result.replace(task_prompt, "").strip()
     return result
+
+
+def _parse_f2_ovd_tokens(od_text: str, image_size: Tuple[int, int],
+                         min_confidence: float = MIN_CONFIDENCE) -> List[Dict]:
+    """解析 Florence-2 OVD 输出的 <loc_N> token 序列为元素列表
+
+    Florence-2 开放词汇检测的实际输出格式：
+      label<loc_x1><loc_y1><loc_x2><loc_y2>                 # 单框
+      label<poly><loc_x1><loc_y1><loc_x2><loc_y2>...</poly> # 多边形
+      label. another_label<loc_x1>...                       # 多标签
+
+    <loc_N> 的 N 为 0~999 的归一化坐标，映射到图像尺寸：
+      px = N / 999 * (width | height)
+
+    Args:
+        od_text: _run_f2_base 返回的（保留 loc token 的）文本
+        image_size: (width, height) 图像像素尺寸
+        min_confidence: 保留的最低置信度（F2 OVD 无显式置信度，忽略过滤）
+
+    Returns:
+        元素列表 [{label, x, y, w, h, cx, cy, confidence}]
+    """
+    if not od_text or not od_text.strip():
+        return []
+
+    w, h = image_size
+    elements: List[Dict] = []
+
+    def _px(n: int, dim: int) -> int:
+        return int(round(n / 999 * dim))
+
+    # 屏幕尺寸（用于过滤全屏误检框）
+    screen_w, screen_h = w, h
+
+    # 1) 提取所有坐标 token 序列（可能包在 <poly></poly> 内）
+    #    同时保留标签文本（非 loc token 部分）
+    #    按 <poly>...</poly> 或连续 <loc_N> 块切分
+    import re as _re
+
+    # 移除 poly 标签，保留内部 loc token
+    cleaned = _re.sub(r"</?poly>", "", od_text)
+
+    # 2) 将"标签文本 + loc序列"拆成段
+    #    模式：非 loc 文本作为 label，随后紧跟的 loc 序列作为其坐标
+    parts = _re.split(r"(<loc_\d+>)", cleaned)
+    # parts 形如 ['icon', '<loc_161>', '<loc_0>', '<loc_195>', '<loc_61>', ...]
+
+    cur_label = ""
+    cur_locs: List[int] = []
+
+    def _flush():
+        nonlocal cur_label, cur_locs
+        if cur_label and len(cur_locs) >= 4:
+            # loc token 两两一组 (x,y)，取多边形/框的包围盒
+            xs = [_px(cur_locs[i], w) for i in range(0, len(cur_locs), 2)]
+            ys = [_px(cur_locs[i + 1], h) for i in range(0, len(cur_locs), 2)]
+            x1, x2 = min(xs), max(xs)
+            y1, y2 = min(ys), max(ys)
+            fw, fh = x2 - x1, y2 - y1
+            # 过滤误检：
+            #   - 框太小（< 4px）
+            #   - 覆盖超过屏幕 90%（多标签 OVD 常退化为整屏默认框 <loc_0><loc_998>）
+            #   - 面积占比超过 85%
+            if fw < 4 or fh < 4:
+                cur_label = ""
+                cur_locs = []
+                return
+            if fw > screen_w * 0.9 or fh > screen_h * 0.9:
+                cur_label = ""
+                cur_locs = []
+                return
+            if (fw * fh) > (screen_w * screen_h) * 0.85:
+                cur_label = ""
+                cur_locs = []
+                return
+            if fw >= 4 and fh >= 4:
+                elements.append({
+                    "label": cur_label.strip(),
+                    "x": x1, "y": y1,
+                    "w": fw, "h": fh,
+                    "cx": (x1 + x2) // 2,
+                    "cy": (y1 + y2) // 2,
+                    "confidence": 1.0,  # F2 OVD 无置信度，默认高置信
+                })
+        cur_label = ""
+        cur_locs = []
+
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("<loc_"):
+            n = _re.sub(r"\D", "", part)
+            if n:
+                cur_locs.append(int(n))
+        else:
+            _flush()
+            cur_label = part.strip()
+
+    _flush()
+
+    # 3) 标签可能含多个（空格/句点分隔），拆分到独立元素
+    expanded: List[Dict] = []
+    for e in elements:
+        labels = [lab.strip() for lab in _re.split(r"[.\s]+", e["label"])
+                  if lab.strip()]
+        if not labels:
+            continue
+        for lab in labels:
+            if lab.lower() in ("s", "/s", ""):
+                continue
+            item = dict(e)
+            item["label"] = lab
+            expanded.append(item)
+    return expanded
+
+
+def _run_f2_ovd(image: Image.Image, query: str,
+                max_tokens: int = 1024) -> List[Dict]:
+    """Florence-2 开放词汇检测（正确解析坐标 token）
+
+    替代旧的 _run_f2_base + _parse_f2_detection 组合——
+    旧组合因 skip_special_tokens=True 丢弃 <loc_N> 坐标，永远返回空。
+
+    Args:
+        image: 输入图像（全屏或区域）
+        query: 检测目标描述（如 "icon. button. text."）
+
+    Returns:
+        元素列表 [{label, x, y, w, h, cx, cy, confidence}]
+    """
+    od_text = _run_f2_base(image, "<OPEN_VOCABULARY_DETECTION>", query,
+                           max_tokens=max_tokens)
+    return _parse_f2_ovd_tokens(od_text, image.size, min_confidence=0.0)
+
+
+# 用于 scan_* 兜底的通用检测标签（每个单独查询，避免多标签退化全屏框）
+_SCAN_FALLBACK_LABELS = [
+    "icon", "button", "window", "menu", "text",
+    "checkbox", "search bar", "taskbar", "input",
+]
+
+
+def _run_f2_ovd_scan(image: Image.Image, query: str,
+                     max_tokens: int = 1024) -> List[Dict]:
+    """F2 开放词汇检测（带逐标签兜底 + 跨标签去重）
+
+    多标签 OVD 在复杂背景下常退化为整屏默认框 <loc_0><loc_0><loc_998><loc_998>
+    或多个标签指向同一框（如 button/text/icon 都在同一位置）。
+    先对多标签结果做 IoU 去重，若仍为空则逐个单标签重新检测。
+
+    Args:
+        image: 输入图像
+        query: 多标签查询（如 "button. text. icon. window. ..."）
+
+    Returns:
+        元素列表 [{label, x, y, w, h, cx, cy, confidence}]
+    """
+    def _dedup(elements: List[Dict]) -> List[Dict]:
+        """IoU > 70% 的框只保留第一个（跨标签去重）"""
+        deduped: List[Dict] = []
+        for e in elements:
+            is_dup = False
+            for d in deduped:
+                ix = max(e["x"], d["x"])
+                iy = max(e["y"], d["y"])
+                ix2 = min(e["x"] + e["w"], d["x"] + d["w"])
+                iy2 = min(e["y"] + e["h"], d["y"] + d["h"])
+                if ix < ix2 and iy < iy2:
+                    inter = (ix2 - ix) * (iy2 - iy)
+                    union = e["w"] * e["h"] + d["w"] * d["h"] - inter
+                    if union > 0 and inter / union > 0.7:
+                        is_dup = True
+                        break
+            if not is_dup:
+                deduped.append(e)
+        return deduped
+
+    elements = _dedup(_run_f2_ovd(image, query, max_tokens=max_tokens))
+    if elements:
+        # 按框面积从小到大排序（优先返回小目标，如图标/按钮）
+        elements.sort(key=lambda e: e["w"] * e["h"])
+        return elements[:MAX_ELEMENTS]
+
+    # 兜底：逐标签检测
+    collected: List[Dict] = []
+    used_labels = set()
+    for lab in _SCAN_FALLBACK_LABELS:
+        if lab in used_labels:
+            continue
+        used_labels.add(lab)
+        try:
+            els = _run_f2_ovd(image, lab, max_tokens=512)
+            collected.extend(els)
+        except Exception:
+            continue
+
+    deduped = _dedup(collected)
+    # 按框面积从小到大排序（优先返回小目标，如图标/按钮）
+    deduped.sort(key=lambda e: e["w"] * e["h"])
+    return deduped[:MAX_ELEMENTS]
 
 
 # ============================================================
@@ -276,6 +483,173 @@ def _translate_query(text: str) -> str:
     return text
 
 
+def _region_to_screen(x_rel: int, y_rel: int, region_x: int, region_y: int,
+                      scale_x: float, scale_y: float) -> Tuple[int, int]:
+    """将放大区域内的相对坐标转换回全屏绝对坐标
+
+    区域截图若被放大（take_region_screenshot 对小区放大 2-4 倍），
+    F2/DINO 返回的是放大图的坐标，必须除以缩放因子再偏移区域原点。
+
+    Args:
+        x_rel, y_rel: 模型返回的区域图内坐标
+        region_x, region_y: 区域在全屏的左上角
+        scale_x, scale_y: 缩放因子（放大了多少倍）
+
+    Returns:
+        (全屏绝对 x, 全屏绝对 y)
+    """
+    return int(x_rel / scale_x) + region_x, int(y_rel / scale_y) + region_y
+
+
+def locate_icon_near_text(target_text: str,
+                          max_anchor_distance: int = 120) -> Dict[str, Any]:
+    """OCR 引导的图标定位：先找文字锚点，再在附近检测图标
+
+    设计背景（解决"桌面图标找不到"根因）：
+      - EasyOCR 内容识别可能出错（如 "Hearts ot"），但文字块位置可靠
+      - Florence-2 在局部放大小区域检测 icon 比全屏可靠
+      - 因此：EasyOCR 定位文字 → 以文字为中心扩展区域 → F2 检测图标
+
+    Windows 桌面图标布局：图形在文字上方（图标名在图形下方）。
+    因此扩展区域取"文字上方为主"（y 向上偏移）。
+
+    Args:
+        target_text: 目标文字（如 "Hearts of Iron" / "钢铁雄心"）
+        max_anchor_distance: 文字锚点距屏幕边缘的最远距离（过滤越界）
+
+    Returns:
+        {
+          "found": bool,
+          "x": int, "y": int,             # 图标中心（全屏绝对坐标）
+          "bbox": [x1,y1,x2,y2],
+          "anchor_text": str,             # OCR 匹配到的文字块
+          "anchor_match": str,            # exact/partial/fuzzy/token
+          "anchor_x": int, "anchor_y": int,
+          "method": str,                  # ocr_guided / direct_f2 / dino
+          "confidence": float,
+        }
+    """
+    # 步骤0: 优先用 UI Automation 精确查找桌面图标（最可靠，不依赖 OCR/视觉）
+    try:
+        from system.desktop_icons import find_desktop_icon
+        icon = find_desktop_icon(target_text)
+        if icon.get("found"):
+            return {
+                "found": True,
+                "x": icon["x"], "y": icon["y"],
+                "bbox": icon.get("bbox", [0, 0, 0, 0]),
+                "anchor_text": icon.get("name", ""),
+                "anchor_match": f"uia_{icon.get('match', '')}",
+                "anchor_x": icon["x"], "anchor_y": icon["y"],
+                "method": "uia_desktop_icon",
+                "confidence": 1.0,
+            }
+    except Exception as e:
+        logger.warning(f"UI Automation 桌面图标定位失败: {e}")
+
+    # 步骤1: OCR 定位文字锚点（多候选）
+    from vision.ocr import find_text_candidates
+    cand = find_text_candidates(target_text, limit=5)
+    if not cand.get("found"):
+        return {"found": False, "x": 0, "y": 0, "bbox": [0, 0, 0, 0],
+                "anchor_text": "", "anchor_match": "", "anchor_x": 0,
+                "anchor_y": 0, "method": "no_anchor", "confidence": 0.0}
+
+    # 步骤2: 对每个锚点候选，扩展区域 → F2 检测 icon
+    #   候选已按分数排序（短文本图标名优先、长命令回显降权）
+    for anchor in cand["candidates"]:
+        ax, ay = anchor["cx"], anchor["cy"]
+        # 过滤边缘文字（离边缘太近可能区域越界）
+        if ax < 20 or ay < 20:
+            continue
+
+        # 过滤过短碎片锚点（单字符/纯符号，如 "O"、"E"、"I"）
+        #   token 匹配可能命中单字母碎片，这些不是有效图标名
+        anchor_text = str(anchor.get("text", "")).strip()
+        anchor_clean = re.sub(r'[\s.…,，。！？、"\']', '', anchor_text)
+        if len(anchor_clean) < 2:
+            continue
+        # 过滤明显是命令/代码回显的锚点（含括号、引号、方括号、等号、python 关键词等）
+        if any(sym in anchor_text for sym in
+               ['(', ')', '[', ']', '"', '=', 'import', 'print', 'python',
+                'text', 'candidates', 'locate', 'find', ':', ';']):
+            continue
+        # 过滤超长锚点（> 14 字符）：很可能是终端命令/窗口标题整句，而非图标名
+        if len(anchor_text) > 14:
+            continue
+        # 过滤含任务动词/介词的长句特征（"打开"、"帮我"、"桌面的"等命令回显词）
+        if any(w in anchor_text for w in
+               ["帮我", "打开桌面", "开始执行", "执行任务", "桌面的", "请帮我"]):
+            continue
+
+        # 图标在文字上方：区域取文字上方为主，x 以文字为中心
+        rw, rh = 160, 110
+        rx = max(0, ax - rw // 2)
+        ry = max(0, ay - rh + 10)   # 图标区域：文字上方约 100px
+        # 区域截图（可能被放大）
+        region = take_region_screenshot(rx, ry, rw, rh)
+        scale_x = region.size[0] / min(rw, region.size[0])
+        scale_y = region.size[1] / min(rh, region.size[1])
+
+        # F2 检测 icon（本地图中找图形）
+        elements = _run_f2_ovd(region, "icon", max_tokens=512)
+        if elements:
+            best = elements[0]
+            abs_x, abs_y = _region_to_screen(
+                best["cx"], best["cy"], rx, ry, scale_x, scale_y
+            )
+            return {
+                "found": True,
+                "x": abs_x, "y": abs_y,
+                "bbox": [abs_x, abs_y, abs_x, abs_y],
+                "anchor_text": anchor["text"],
+                "anchor_match": anchor["match"],
+                "anchor_x": ax, "anchor_y": ay,
+                "method": "ocr_guided_f2",
+                "confidence": best["confidence"],
+            }
+
+        # F2 失败 → DINO 兜底（本地图）
+        try:
+            _load_grounding_dino()
+            inputs = _gd_processor(images=region, text="icon",
+                                   return_tensors="pt")
+            with torch.no_grad():
+                outputs = _gd_model(**inputs)
+            results = _gd_processor.post_process_grounded_object_detection(
+                outputs, inputs.input_ids,
+                box_threshold=0.25, text_threshold=0.2,
+                target_sizes=[region.size[::-1]]
+            )
+            r = results[0]
+            if len(r["boxes"]) > 0:
+                box = r["boxes"][0].tolist()
+                abs_x, abs_y = _region_to_screen(
+                    int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2),
+                    rx, ry, scale_x, scale_y
+                )
+                return {
+                    "found": True,
+                    "x": abs_x, "y": abs_y,
+                    "bbox": [abs_x, abs_y, abs_x, abs_y],
+                    "anchor_text": anchor["text"],
+                    "anchor_match": anchor["match"],
+                    "anchor_x": ax, "anchor_y": ay,
+                    "method": "ocr_guided_dino",
+                    "confidence": float(r["scores"][0]),
+                }
+        except Exception as e:
+            logger.warning(f"OCR 引导 DINO 定位失败: {e}")
+
+    # 步骤3: 全部锚点失败
+    first = cand["candidates"][0]
+    return {"found": False, "x": 0, "y": 0, "bbox": [0, 0, 0, 0],
+            "anchor_text": first.get("text", ""),
+            "anchor_match": first.get("match", ""),
+            "anchor_x": first["cx"], "anchor_y": first["cy"],
+            "method": "anchor_found_no_icon", "confidence": 0.0}
+
+
 # ============================================================
 # 对外接口 1：scan_screen() — 全屏扫描（F2-base 开放词汇检测）
 # ============================================================
@@ -307,9 +681,7 @@ def scan_screen() -> str:
         # 用 F2-base 做开放词汇检测
         # 注意：不包含 image/logo 等易误检词
         query = "button. text. icon. window. taskbar. menu. input. search bar. checkbox."
-        od_result = _run_f2_base(screenshot, "<OPEN_VOCABULARY_DETECTION>", query, max_tokens=1024)
-
-        elements = _parse_f2_detection(od_result, min_confidence=MIN_CONFIDENCE)
+        elements = _run_f2_ovd_scan(screenshot, query, max_tokens=1024)
 
         # 按置信度排序，取置信度最高的前 MAX_ELEMENTS 个
         elements.sort(key=lambda e: e["confidence"], reverse=True)
@@ -358,6 +730,9 @@ def scan_region(x: int, y: int, width: int, height: int) -> str:
         screen_w, screen_h = pyautogui.size()
         actual_w = min(width, screen_w - x)
         actual_h = min(height, screen_h - y)
+        # 区域缩放因子（take_region_screenshot 对小区会放大）
+        scale_x = region.size[0] / max(1, actual_w)
+        scale_y = region.size[1] / max(1, actual_h)
 
         # 场景判断
         if _is_text_dominated_scene(region):
@@ -371,15 +746,13 @@ def scan_region(x: int, y: int, width: int, height: int) -> str:
             }, ensure_ascii=False)
 
         query = "button. text. icon. window. menu. input. search bar. checkbox."
-        od_result = _run_f2_base(region, "<OPEN_VOCABULARY_DETECTION>", query, max_tokens=1024)
-
-        elements = _parse_f2_detection(od_result, min_confidence=MIN_CONFIDENCE)
-        # 转换坐标为全屏绝对坐标
+        elements = _run_f2_ovd_scan(region, query, max_tokens=1024)
+        # 转换坐标为全屏绝对坐标（除以缩放因子 + 偏移区域原点）
         for e in elements:
-            e["x"] += x
-            e["y"] += y
-            e["cx"] += x
-            e["cy"] += y
+            e["x"], e["y"] = _region_to_screen(e["x"], e["y"], x, y, scale_x, scale_y)
+            e["cx"], e["cy"] = _region_to_screen(e["cx"], e["cy"], x, y, scale_x, scale_y)
+            e["w"] = int(e["w"] / scale_x)
+            e["h"] = int(e["h"] / scale_y)
 
         result = {
             "screen": f"{screen_w}x{screen_h}",
@@ -427,14 +800,17 @@ def scan_grid(rows: int = 2, cols: int = 3) -> str:
                     continue
 
                 query = "button. text. icon. window. menu. input. search bar."
-                od_result = _run_f2_base(region, "<OPEN_VOCABULARY_DETECTION>", query, max_tokens=512)
-
-                elements = _parse_f2_detection(od_result, min_confidence=MIN_CONFIDENCE)
+                elements = _run_f2_ovd_scan(region, query, max_tokens=512)
+                # 每个格子的缩放因子
+                g_scale_x = region.size[0] / max(1, cell_w)
+                g_scale_y = region.size[1] / max(1, cell_h)
                 for e in elements:
-                    e["x"] += cx
-                    e["y"] += cy
-                    e["cx"] += cx
-                    e["cy"] += cy
+                    e["x"], e["y"] = _region_to_screen(
+                        e["x"], e["y"], cx, cy, g_scale_x, g_scale_y)
+                    e["cx"], e["cy"] = _region_to_screen(
+                        e["cx"], e["cy"], cx, cy, g_scale_x, g_scale_y)
+                    e["w"] = int(e["w"] / g_scale_x)
+                    e["h"] = int(e["h"] / g_scale_y)
                     e["grid"] = f"({r+1},{c+1})"
 
                 all_elements.extend(elements)
@@ -476,8 +852,7 @@ def locate_element(target_description: str) -> Dict[str, Any]:
     # 先用 F2-base 检测
     try:
         screenshot = take_screenshot()
-        od_result = _run_f2_base(screenshot, "<OPEN_VOCABULARY_DETECTION>", en_query, max_tokens=512)
-        elements = _parse_f2_detection(od_result, min_confidence=MIN_CONFIDENCE)
+        elements = _run_f2_ovd(screenshot, en_query, max_tokens=512)
         if elements:
             best = elements[0]
             return {
@@ -532,6 +907,8 @@ def locate_in_region(target_description: str, x: int, y: int,
     # 先用 F2-base
     try:
         region = take_region_screenshot(x, y, width, height)
+        scale_x = region.size[0] / max(1, width)
+        scale_y = region.size[1] / max(1, height)
 
         # 如果是文本区域，直接提示用 OCR
         if _is_text_dominated_scene(region):
@@ -544,15 +921,19 @@ def locate_in_region(target_description: str, x: int, y: int,
             }
 
         od_result = _run_f2_base(region, "<OPEN_VOCABULARY_DETECTION>", en_query, max_tokens=512)
-        elements = _parse_f2_detection(od_result, min_confidence=MIN_CONFIDENCE)
+        elements = _parse_f2_ovd_tokens(od_result, region.size, min_confidence=0.0)
         if elements:
             best = elements[0]
+            abs_x, abs_y = _region_to_screen(
+                best["cx"], best["cy"], x, y, scale_x, scale_y)
+            abs_x1, abs_y1 = _region_to_screen(
+                best["x"], best["y"], x, y, scale_x, scale_y)
+            abs_w = int(best["w"] / scale_x)
+            abs_h = int(best["h"] / scale_y)
             return {
                 "found": True,
-                "x": best["cx"] + x,
-                "y": best["cy"] + y,
-                "bbox": [best["x"] + x, best["y"] + y,
-                         best["x"] + best["w"] + x, best["y"] + best["h"] + y],
+                "x": abs_x, "y": abs_y,
+                "bbox": [abs_x1, abs_y1, abs_x1 + abs_w, abs_y1 + abs_h],
                 "confidence": best["confidence"],
             }
     except Exception as e:
@@ -562,6 +943,8 @@ def locate_in_region(target_description: str, x: int, y: int,
     try:
         _load_grounding_dino()
         region = take_region_screenshot(x, y, width, height)
+        scale_x = region.size[0] / max(1, width)
+        scale_y = region.size[1] / max(1, height)
 
         inputs = _gd_processor(images=region, text=en_query, return_tensors="pt")
         with torch.no_grad():
@@ -578,12 +961,17 @@ def locate_in_region(target_description: str, x: int, y: int,
             best_idx = result["scores"].argmax().item()
             box = result["boxes"][best_idx].tolist()
             score = result["scores"][best_idx].item()
+            abs_x, abs_y = _region_to_screen(
+                int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2),
+                x, y, scale_x, scale_y)
+            abs_x1, abs_y1 = _region_to_screen(
+                int(box[0]), int(box[1]), x, y, scale_x, scale_y)
+            abs_w = int((box[2] - box[0]) / scale_x)
+            abs_h = int((box[3] - box[1]) / scale_y)
             return {
                 "found": True,
-                "x": int((box[0] + box[2]) / 2) + x,
-                "y": int((box[1] + box[3]) / 2) + y,
-                "bbox": [int(box[0]) + x, int(box[1]) + y,
-                         int(box[2]) + x, int(box[3]) + y],
+                "x": abs_x, "y": abs_y,
+                "bbox": [abs_x1, abs_y1, abs_x1 + abs_w, abs_y1 + abs_h],
                 "confidence": score,
             }
     except Exception as e:
