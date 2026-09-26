@@ -20,6 +20,7 @@ from vision.ocr import ocr_screen, ocr_region, find_text_on_screen
 from vision.engine import take_screenshot, take_region_screenshot
 from vision.router import suggest_detection_strategy
 from agent.tracker import ObjectTracker
+from system import input_controller as input_ctl
 
 # ============================================================
 # 视觉对象记忆（全局单例：加速重复定位，不改变工具接口）
@@ -27,20 +28,29 @@ from agent.tracker import ObjectTracker
 _tracker = ObjectTracker(max_objects=30)
 
 
+def _current_foreground() -> str:
+    """当前前台窗口标题（用于对象缓存的"跨窗口失效"判断）"""
+    try:
+        return input_ctl.get_window_title(input_ctl.get_foreground_window()) or ""
+    except Exception:
+        return ""
+
+
 def _tracked_locate(target_description: str) -> Dict:
     """对象记忆加速的 locate_element
 
-    首次：全屏定位 → 缓存结果
-    再次：优先在缓存邻域小范围重定位 → 命中直接返回；未命中回退全屏
+    首次：全屏定位 → 缓存结果（含前台窗口标题）
+    再次：仅当"页面未变 且 前台窗口一致"才在缓存邻域小范围重定位
     """
     try:
         # 屏幕签名（检测页面变化）
         shot = take_screenshot()
         from agent.tracker import _image_signature
         sig = _image_signature(shot)
+        fg = _current_foreground()
 
-        # 缓存可用 → 邻域重扫
-        if _tracker.should_use_cached(target_description, sig):
+        # 缓存可用（页面未变 + 前台窗口一致）→ 邻域重扫
+        if _tracker.should_use_cached(target_description, sig, fg):
             cached = _tracker.get(target_description)
             if cached is not None:
                 region = _tracker.get_neighborhood(target_description)
@@ -56,7 +66,7 @@ def _tracked_locate(target_description: str) -> Dict:
                                 _tracker.track(
                                     target_description, bbox,
                                     result.get("confidence", 0.5), sig,
-                                    source="tracked",
+                                    source="tracked", foreground=fg,
                                 )
                         return result
                     else:
@@ -71,7 +81,7 @@ def _tracked_locate(target_description: str) -> Dict:
                 _tracker.track(
                     target_description, bbox,
                     result.get("confidence", 0.5), sig,
-                    source="locate",
+                    source="locate", foreground=fg,
                 )
         return result
     except Exception:
@@ -81,17 +91,22 @@ def _tracked_locate(target_description: str) -> Dict:
 
 def _tracked_locate_region(target_description: str, x: int, y: int,
                            width: int, height: int) -> Dict:
-    """对象记忆加速的 locate_in_region（区域定位同样缓存）"""
+    """对象记忆加速的 locate_in_region（区域定位同样缓存）
+
+    安全约束（P4）：仅当"区域截图未变 且 前台窗口一致 且 缓存新鲜(≤2s)"
+    才直接复用缓存坐标；否则重新做区域定位，避免拿过期坐标去点。
+    """
     try:
         region_shot = take_region_screenshot(x, y, width, height)
         from agent.tracker import _image_signature
         sig = _image_signature(region_shot)
+        fg = _current_foreground()
         key = f"region:{target_description}:{x},{y}"
 
-        if _tracker.should_use_cached(key, sig):
+        if _tracker.should_use_cached(key, sig, fg):
             cached = _tracker.get(key)
-            if cached is not None:
-                # 直接复用缓存的相对位置（区域未变）
+            if cached is not None and (time.time() - cached.last_seen) <= 2.0:
+                # 复用缓存的相对位置（区域未变 + 窗口一致 + 新鲜）
                 result = {
                     "found": True,
                     "x": cached.center[0],
@@ -108,7 +123,7 @@ def _tracked_locate_region(target_description: str, x: int, y: int,
             bbox = result.get("bbox", [])
             if len(bbox) == 4:
                 _tracker.track(key, bbox, result.get("confidence", 0.5), sig,
-                               source="locate_region")
+                               source="locate_region", foreground=fg)
         return result
     except Exception:
         return locate_in_region(target_description, x, y, width, height)
@@ -127,193 +142,53 @@ except ImportError:
     WIN32_AVAILABLE = False
 
 
+# ============================================================
+# 输入薄包装（已重构：全部委托 system.input_controller）
+# ------------------------------------------------------------
+# 旧实现直接用已废弃的 mouse_event / keybd_event，且
+#   - 不激活前台窗口 → 首次点击被吞
+#   - 不做权限(UIPI)预检 → 提权窗口静默丢弃输入
+#   - 不做到位校验 → 输入无效仍返回成功
+# 现统一委托 SendInput 实现，以下包装仅为向后兼容保留。
+# ============================================================
+
 def _win32_set_cursor_pos(x: int, y: int):
-    """使用 Win32 API 移动鼠标，失败时回退 pyautogui"""
-    if WIN32_AVAILABLE:
-        try:
-            win32api.SetCursorPos((x, y))
-            return
-        except Exception:
-            pass  # Win32 失败，回退 pyautogui
-    pyautogui.moveTo(x, y, duration=0.1)
+    """移动鼠标（SendInput 绝对定位 + 到位校验）"""
+    r = input_ctl.move_to(x, y)
+    if not r.get("ok") and not WIN32_AVAILABLE:
+        pyautogui.moveTo(x, y, duration=0.1)
+    return r
 
 
 def _win32_mouse_click(button: str = "left"):
-    """使用 Win32 API 发送真实鼠标点击事件"""
-    if not WIN32_AVAILABLE:
-        pyautogui.click()
-        return
-
-    if button == "double":
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        time.sleep(0.05)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-    elif button == "right":
-        win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
-    else:
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    """点击（SendInput；double 走双击序列）"""
+    b = "right" if button == "right" else "left"
+    return input_ctl.click(b, double=(button == "double"))
 
 
 def _win32_send_key(key: str):
-    """使用 Win32 API 发送按键事件"""
-    if not WIN32_AVAILABLE:
-        pyautogui.press(key)
-        return
-
-    # 映射 pyautogui 键名到虚拟键码
-    KEY_MAP = {
-        'enter': 0x0D, 'return': 0x0D,
-        'tab': 0x09,
-        'escape': 0x1B, 'esc': 0x1B,
-        'backspace': 0x08,
-        'delete': 0x2E, 'del': 0x2E,
-        'space': 0x20,
-        'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
-        'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73,
-        'f5': 0x74, 'f6': 0x75, 'f7': 0x76, 'f8': 0x77,
-        'f9': 0x78, 'f10': 0x79, 'f11': 0x7A, 'f12': 0x7B,
-        'home': 0x24, 'end': 0x23, 'pageup': 0x21, 'pagedown': 0x22,
-        'insert': 0x2D,
-        'win': 0x5B, 'lwin': 0x5B, 'rwin': 0x5C,
-        'alt': 0x12, 'lalt': 0xA4, 'ralt': 0xA5,
-        'ctrl': 0x11, 'lctrl': 0xA2, 'rctrl': 0xA3,
-        'shift': 0x10, 'lshift': 0xA0, 'rshift': 0xA1,
-        'capslock': 0x14,
-        '0': 0x30, '1': 0x31, '2': 0x32, '3': 0x33, '4': 0x34,
-        '5': 0x35, '6': 0x36, '7': 0x37, '8': 0x38, '9': 0x39,
-        'a': 0x41, 'b': 0x42, 'c': 0x43, 'd': 0x44, 'e': 0x45,
-        'f': 0x46, 'g': 0x47, 'h': 0x48, 'i': 0x49, 'j': 0x4A,
-        'k': 0x4B, 'l': 0x4C, 'm': 0x4D, 'n': 0x4E, 'o': 0x4F,
-        'p': 0x50, 'q': 0x51, 'r': 0x52, 's': 0x53, 't': 0x54,
-        'u': 0x55, 'v': 0x56, 'w': 0x57, 'x': 0x58, 'y': 0x59, 'z': 0x5A,
-        ';': 0xBA, "'": 0xDE, ',': 0xBC, '.': 0xBE, '/': 0xBF,
-        '\\': 0xDC, '[': 0xDB, ']': 0xDD, '-': 0xBD, '=': 0xBB,
-        '`': 0xC0,
-    }
-
-    key_lower = key.lower().strip()
-    vk = KEY_MAP.get(key_lower)
-    if vk is None:
-        # 尝试用 ord 处理单个字符
-        if len(key) == 1:
-            vk = ord(key.upper())
-        else:
-            vk = 0
-
-    if vk:
-        win32api.keybd_event(vk, 0, 0, 0)
-        time.sleep(0.03)
-        win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-    else:
-        pyautogui.press(key)
+    """按键（委托 input_controller：自动为方向键/编辑键加扩展标志）"""
+    return input_ctl.press_key(key)
 
 
 def _win32_send_text(text: str):
-    """使用 Win32 API 发送文本（通过剪贴板 + Ctrl+V）"""
-    if not WIN32_AVAILABLE:
-        pyperclip.copy(text)
-        pyautogui.hotkey('ctrl', 'v')
-        return
+    """输入文本（委托 input_controller：pyperclip 持久化 + 校验 + 粘贴等待）
 
-    # 保存当前剪贴板内容
-    old_clip = None
-    try:
-        import tkinter as tk
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            old_clip = root.clipboard_get()
-        except tk.TclError:
-            pass
-        root.clipboard_clear()
-        root.clipboard_append(text)
-        root.update()
-        root.destroy()
-    except Exception:
-        pyperclip.copy(text)
-
-    _win32_multi_key(['ctrl', 'v'])
-    time.sleep(0.1)
-
-    # 恢复旧剪贴板
-    if old_clip is not None:
-        try:
-            pyperclip.copy(old_clip)
-        except Exception:
-            pass
+    旧实现的问题（已修）：
+      - 依赖 Tk 实例存活，实例销毁后剪贴板内容可能丢失
+      - 粘贴后仅 sleep(0.1) 就还原旧剪贴板 → 慢应用会贴成旧内容
+    """
+    return input_ctl.type_text(text)
 
 
 def _win32_multi_key(keys: list):
-    """按下组合键，如 ['ctrl', 'v']"""
-    if not WIN32_AVAILABLE:
-        pyautogui.hotkey(*keys)
-        return
-
-    MOD_KEYS = ['ctrl', 'lctrl', 'rctrl', 'alt', 'lalt', 'ralt',
-                'shift', 'lshift', 'rshift', 'win', 'lwin', 'rwin']
-
-    # 按下修饰键
-    mod_vks = []
-    for k in keys:
-        k_lower = k.lower()
-        if k_lower in MOD_KEYS:
-            vk = _key_name_to_vk(k_lower)
-            if vk:
-                win32api.keybd_event(vk, 0, 0, 0)
-                mod_vks.append(vk)
-
-    # 按普通键
-    for k in keys:
-        k_lower = k.lower()
-        if k_lower not in MOD_KEYS:
-            vk = _key_name_to_vk(k_lower)
-            if vk:
-                win32api.keybd_event(vk, 0, 0, 0)
-                time.sleep(0.02)
-                win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-
-    # 释放修饰键（反向顺序）
-    for vk in reversed(mod_vks):
-        if vk:
-            win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+    """组合键（委托 input_controller：修饰键先按后放，扩展键带标志）"""
+    return input_ctl.hotkey(keys)
 
 
 def _key_name_to_vk(key: str) -> int:
-    """将键名转为虚拟键码"""
-    KEY_MAP = {
-        'enter': 0x0D, 'return': 0x0D,
-        'tab': 0x09,
-        'escape': 0x1B, 'esc': 0x1B,
-        'backspace': 0x08,
-        'delete': 0x2E, 'del': 0x2E,
-        'space': 0x20,
-        'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
-        'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73,
-        'f5': 0x74, 'f6': 0x75, 'f7': 0x76, 'f8': 0x77,
-        'f9': 0x78, 'f10': 0x79, 'f11': 0x7A, 'f12': 0x7B,
-        'home': 0x24, 'end': 0x23, 'pageup': 0x21, 'pagedown': 0x22,
-        'insert': 0x2D,
-        'win': 0x5B, 'lwin': 0x5B, 'rwin': 0x5C,
-        'alt': 0x12, 'lalt': 0xA4, 'ralt': 0xA5,
-        'ctrl': 0x11, 'lctrl': 0xA2, 'rctrl': 0xA3,
-        'shift': 0x10, 'lshift': 0xA0, 'rshift': 0xA1,
-        'capslock': 0x14,
-        '0': 0x30, '1': 0x31, '2': 0x32, '3': 0x33, '4': 0x34,
-        '5': 0x35, '6': 0x36, '7': 0x37, '8': 0x38, '9': 0x39,
-        'a': 0x41, 'b': 0x42, 'c': 0x43, 'd': 0x44, 'e': 0x45,
-        'f': 0x46, 'g': 0x47, 'h': 0x48, 'i': 0x49, 'j': 0x4A,
-        'k': 0x4B, 'l': 0x4C, 'm': 0x4D, 'n': 0x4E, 'o': 0x4F,
-        'p': 0x50, 'q': 0x51, 'r': 0x52, 's': 0x53, 't': 0x54,
-        'u': 0x55, 'v': 0x56, 'w': 0x57, 'x': 0x58, 'y': 0x59, 'z': 0x5A,
-        ';': 0xBA, "'": 0xDE, ',': 0xBC, '.': 0xBE, '/': 0xBF,
-        '\\': 0xDC, '[': 0xDB, ']': 0xDD, '-': 0xBD, '=': 0xBB,
-        '`': 0xC0,
-    }
-    return KEY_MAP.get(key, 0)
+    """键名 → 虚拟键码（委托 input_controller，唯一映射源）"""
+    return input_ctl.key_name_to_vk(key)
 
 
 # ============================================================
@@ -451,37 +326,104 @@ def visual_locate_region(target_description: str, x: int, y: int,
 
 
 # ============================================================
-# 鼠标操作工具（Win32 API 实现，更可靠）
+# 鼠标操作工具（SendInput + 前台激活 + 权限预检 + 到位校验）
 # ============================================================
+
+# ============================================================
+# 假点击检测：点击后界面是否真的发生变化
+# ------------------------------------------------------------
+# 现象：SendInput 报"事件已送达"，但目标程序并未响应
+#   （窗口未真正聚焦 / 反作弊 / 目标已消失），于是返回 "✅ 已点击"
+#   却毫无效果 —— 即"假点击"。更糟的是 Agent 会反复点同一坐标。
+# 这里用"点击前后画面签名"做客观判定，并把"同一坐标重复点击且始终
+# 无变化"升级为**失败**，确保 Agent 不会陷在假点击循环里。
+# ============================================================
+_LAST_CLICK = {"coord": None, "sig_before": "", "sig_after": ""}
+_CLICK_EFFECT_WAIT = 0.35
+
+
+def _screen_sig() -> str:
+    """当前屏幕的轻量签名（用于判断界面是否变化）"""
+    try:
+        from agent.tracker import _image_signature
+        return _image_signature(take_screenshot())
+    except Exception:
+        return ""
+
+
+def reset_fake_click_state():
+    """重置假点击检测状态（新任务开始时调用）"""
+    _LAST_CLICK["coord"] = None
+    _LAST_CLICK["sig_before"] = ""
+    _LAST_CLICK["sig_after"] = ""
+
 
 @tool
 def click_at(x: int, y: int, button: str = "left") -> str:
-    """【点击】在屏幕指定坐标执行鼠标点击。
+    """【点击】在屏幕指定坐标执行鼠标点击（含真实性校验）。
     x: 横坐标（像素），y: 纵坐标（像素）。
     button: 鼠标按键，可选 'left'（左键）、'right'（右键）、'double'（双击），默认左键。
-    先用 visual_locate() 或 visual_locate_region() 获取坐标，再用此工具点击。"""
+    系统会自动：激活目标窗口 → SendInput 绝对定位 → 校验光标到位 → 点击
+    → 对比点击前后画面判断是否真的生效。
+    若目标窗口以管理员权限运行而本程序未提权（UIPI 会丢弃输入），
+    或同一坐标重复点击且界面始终无变化，将返回明确失败而非假成功。"""
     try:
         target_x, target_y = int(x), int(y)
 
-        # 移动鼠标（Win32 API 优先，失败自动回退 pyautogui）
-        _win32_set_cursor_pos(target_x, target_y)
-        time.sleep(0.15)
+        # 点击前画面签名（用于判断点击是否真的产生效果）
+        sig_before = _screen_sig()
 
-        # 执行点击（Win32 API 优先）
-        _win32_mouse_click(button)
+        r = input_ctl.click_at_point(
+            target_x, target_y, button=("right" if button == "right" else "left"),
+            double=(button == "double"),
+        )
 
-        # 验证位置
-        if WIN32_AVAILABLE:
-            after = win32api.GetCursorPos()
-        else:
-            after = pyautogui.position()
+        label = ("双击" if button == "double"
+                 else ("右键" if button == "right" else "左键"))
 
-        result = f"✅ 已点击 ({target_x}, {target_y}) {'双击' if button == 'double' else '右键' if button == 'right' else '左键'}"
+        if not r.get("ok"):
+            reason = r.get("error", "未知原因")
+            extra = " [需以管理员身份运行本程序]" if r.get("uipi_conflict") else ""
+            return f"点击失败: {reason}{extra}"
 
-        # 防误报检测：如果鼠标实际位置偏离目标太多，标记警告
-        if abs(after[0] - target_x) > 50 or abs(after[1] - target_y) > 50:
-            result += f" [注意：鼠标可能被拦截，实际位置({after[0]},{after[1]})]"
+        # 等待界面响应后取第二次签名
+        time.sleep(_CLICK_EFFECT_WAIT)
+        sig_after = _screen_sig()
 
+        # —— 假点击判定：上一次同坐标点击也没引起任何变化 ——
+        prev = _LAST_CLICK
+        repeat_ineffective = False
+        try:
+            if (prev["coord"] and prev["sig_before"] and prev["sig_after"]
+                    and prev["sig_before"] == prev["sig_after"]):
+                px, py = prev["coord"]
+                if abs(px - target_x) <= 8 and abs(py - target_y) <= 8:
+                    repeat_ineffective = True
+        except Exception:
+            pass
+
+        _LAST_CLICK["coord"] = (target_x, target_y)
+        _LAST_CLICK["sig_before"] = sig_before
+        _LAST_CLICK["sig_after"] = sig_after
+
+        if repeat_ineffective:
+            return (
+                f"点击失败: 同一坐标 ({target_x}, {target_y}) 重复点击，"
+                f"且界面始终没有任何变化 —— 点击未生效（假点击）。\n"
+                f"请**立即停止重复点击**：重新观察屏幕确认目标是否仍然存在"
+                f"（visual_find_text / visual_read_region），"
+                f"或改用 press_key / hotkey / run_powershell 换一条路径。"
+            )
+
+        result = f"✅ 已点击 ({target_x}, {target_y}) {label}"
+        fg = r.get("foreground", "")
+        if fg:
+            result += f" [前台窗口: {fg[:40]}]"
+        if r.get("foreground_warning"):
+            result += f" [警告：{r['foreground_warning']}]"
+        # 单次点击无变化 → 给出显式警告（可能是慢加载，也可能是目标无效）
+        if sig_before and sig_after and sig_before == sig_after:
+            result += " [警告: 点击后界面无变化，若下一步仍无进展请换方式]"
         return result
 
     except Exception as e:
@@ -490,45 +432,31 @@ def click_at(x: int, y: int, button: str = "left") -> str:
 
 @tool
 def drag_mouse(start_x: int, start_y: int, end_x: int, end_y: int, duration: float = 0.5) -> str:
-    """【拖拽】从起点到终点拖拽鼠标。适用于拖拽文件、滑动滑块、选择文本等操作。"""
+    """【拖拽】从起点到终点拖拽鼠标（SendInput 实现 + 起点到位校验）。
+    适用于拖拽文件、滑动滑块、选择文本等操作。"""
     try:
-        if WIN32_AVAILABLE:
-            # Win32 API 拖拽
-            win32api.SetCursorPos((int(start_x), int(start_y)))
-            time.sleep(0.1)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            time.sleep(0.1)
-
-            # 渐变移动
-            steps = max(int(duration * 20), 5)
-            for i in range(1, steps + 1):
-                cx = int(start_x + (end_x - start_x) * i / steps)
-                cy = int(start_y + (end_y - start_y) * i / steps)
-                win32api.SetCursorPos((cx, cy))
-                time.sleep(duration / steps)
-
-            time.sleep(0.1)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        else:
-            # pyautogui 降级
-            pyautogui.moveTo(int(start_x), int(start_y), duration=0.2)
-            time.sleep(0.1)
-            pyautogui.drag(int(end_x) - int(start_x), int(end_y) - int(start_y), duration=float(duration))
-
+        r = input_ctl.drag(int(start_x), int(start_y),
+                           int(end_x), int(end_y), duration=float(duration))
+        if not r.get("ok"):
+            return f"拖拽失败: {r.get('error', '未知原因')}"
         return f"✅ 已从 ({start_x}, {start_y}) 拖拽到 ({end_x}, {end_y})"
     except Exception as e:
         return f"拖拽失败: {str(e)}"
 
 
 # ============================================================
-# 键盘操作工具（Win32 API 实现，更可靠）
+# 键盘操作工具（SendInput + 扩展键 + 发送校验）
 # ============================================================
 
 @tool
 def type_text(text: str) -> str:
-    """【输入】在当前光标位置输入文字。支持中文，通过剪贴板粘贴实现。"""
+    """【输入】在当前光标位置输入文字（支持中文，经剪贴板粘贴）。
+    内部会校验剪贴板写入并在粘贴完成后才还原旧剪贴板。
+    若目标窗口为管理员权限而本程序未提权，将返回明确失败。"""
     try:
-        _win32_send_text(text)
+        r = input_ctl.type_text(text)
+        if not r.get("ok"):
+            return f"输入失败: {r.get('error', '未知原因')}"
         display = text[:50] + ('...' if len(text) > 50 else '')
         return f"✅ 已输入: [{display}]"
     except Exception as e:
@@ -537,12 +465,15 @@ def type_text(text: str) -> str:
 
 @tool
 def press_key(key: str) -> str:
-    """【按键】按下并释放一个键盘按键。
+    """【按键】按下并释放一个键盘按键（方向键/编辑键自动带扩展标志）。
     key: 键名，如 'enter', 'tab', 'escape', 'backspace', 'delete', 'f5', 'space',
           'win', 'alt', 'ctrl', 'shift', 'up', 'down', 'left', 'right' 等。"""
     try:
-        _win32_send_key(key)
-        return f"✅ 已按下 {key}"
+        r = input_ctl.press_key(key)
+        if not r.get("ok"):
+            return f"按键失败: {r.get('error', '事件未送达')} (key={key})"
+        ext = " [扩展键]" if r.get("extended") else ""
+        return f"✅ 已按下 {key}{ext}"
     except Exception as e:
         return f"按键失败: {str(e)}"
 
@@ -551,8 +482,11 @@ def press_key(key: str) -> str:
 def hotkey(keys: list) -> str:
     """【组合键】按下键盘组合键。如 ['ctrl', 'c'], ['win', 'd'], ['alt', 'tab'], ['win', 'r']。"""
     try:
-        _win32_multi_key(keys)
-        return f"✅ 已按下 {'+'.join(keys)}"
+        r = input_ctl.hotkey(keys)
+        joined = '+'.join(str(k) for k in keys)
+        if not r.get("ok"):
+            return f"组合键失败: {r.get('error', '事件未送达')} ({joined})"
+        return f"✅ 已按下 {joined}"
     except Exception as e:
         return f"组合键失败: {str(e)}"
 
