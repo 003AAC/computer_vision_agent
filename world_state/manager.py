@@ -10,7 +10,7 @@ World State Manager - 世界状态管理器
 """
 from typing import Dict, Any, List, Optional
 
-from world_state.base import Belief
+from world_state.base import Belief, StateField
 from world_state.state import (
     EnvironmentState, UIState, ApplicationState, FileState, TaskState,
 )
@@ -150,6 +150,11 @@ class WorldStateManager:
                     self.environment, upd.field, upd.value, upd.source, upd.note
                 )
             elif upd.domain == "ui":
+                if upd.field == "visible_texts":
+                    self.observe_screen_texts(
+                        upd.value, source=upd.source, note=upd.note
+                    )
+                    return
                 self._apply_to_state(
                     self.ui, upd.field, upd.value, upd.source, upd.note
                 )
@@ -207,34 +212,39 @@ class WorldStateManager:
         tool_args = tool_args or {}
         try:
             if tool_name == "run_powershell":
-                self._autowrite_powershell(result_str)
+                self._autowrite_powershell(
+                    result_str, str(tool_args.get("command", ""))
+                )
         except Exception as e:
             print(f"  [WorldState] autowrite 失败 ({tool_name}): {e}")
 
-    def _autowrite_powershell(self, result_str: str):
+    def _autowrite_powershell(self, result_str: str, command: str = ""):
         """解析 PowerShell 输出的客观事实"""
         import re
         text = result_str
 
         # 1. Test-Path ... True/False → filesystem.exists
-        #    识别 "Test-Path 'C:\\xxx'  True" 或命令输出中包含路径与 True
-        for m in re.finditer(r'Test-Path[^\n]*?([A-Za-z]:\\[^\s"\']+)', text):
-            path = m.group(1)
-            # 默认标记存在（能走到这里通常命令输出正常）
-            self._known_file(path, True, source="code_check", note="Test-Path 验证")
-
-        # 2. Start-Process 成功 → process_running=True
-        if "Start-Process" in text and ("命令执行成功" in text or "已启动" in text):
-            # 尝试从命令中提取 exe 名
-            cmd_match = re.search(r'Start-Process\s+[-\w]*\s*["\']?([A-Za-z0-9_ .\\-]+?)(?:\.exe)?["\']?',
-                                  text)
-            if cmd_match:
-                name = cmd_match.group(1).strip().split("\\")[-1]
-                if name:
-                    self._application_fact(
-                        name, "process_running", True,
-                        source="powershell", note="Start-Process 已启动"
-                    )
+        # Use the original command for its path and the actual output for truth value.
+        if re.search(r"\bTest-Path\b", command, re.IGNORECASE):
+            path_match = re.search(
+                r"\bTest-Path\b(?:\s+-LiteralPath|\s+-Path)?\s+"
+                r"(?:'([^']+)'|\"([^\"]+)\"|([^\s;|]+))",
+                command,
+                re.IGNORECASE,
+            )
+            output_match = re.search(
+                r"(?:命令执行成功\s*)?(True|False)\s*$",
+                text,
+                re.IGNORECASE,
+            )
+            if path_match and output_match:
+                path = next(group for group in path_match.groups() if group is not None)
+                self._known_file(
+                    path,
+                    output_match.group(1).lower() == "true",
+                    source="code_check",
+                    note="Test-Path 验证",
+                )
 
         # 3. Get-Process → 提取进程名与 PID
         #    匹配格式（行尾最后两列 PID + 进程名）:
@@ -273,17 +283,11 @@ class WorldStateManager:
     def _known_file(self, path: str, exists: bool, source: str = "code_check",
                     note: str = ""):
         """记录文件存在性到 files dict"""
-        import os
         # 归一化路径
         norm = path.replace("/", "\\")
         if norm not in self.files:
             self.files[norm] = FileState(norm)
         self.files[norm].exists.add_evidence(source, exists, note)
-        # 判断是否为目录（无扩展名视为目录）
-        base = os.path.basename(norm.rstrip("\\"))
-        is_dir = bool(base and "." not in base)
-        if is_dir:
-            self.files[norm].is_dir.add_evidence(source, True, note)
 
     def _application_fact(self, name: str, field: str, value: Any,
                           source: str = "system_api", note: str = ""):
@@ -318,8 +322,17 @@ class WorldStateManager:
 
     def set_ui(self, field: str, value: Any, source: str = "default",
                note: str = ""):
+        if field == "visible_texts":
+            self.observe_screen_texts(value, source=source, note=note)
+            return
         if hasattr(self.ui, field):
             getattr(self.ui, field).add_evidence(source, value, note)
+
+    def observe_screen_texts(self, texts: List[str], source: str = "ocr",
+                             note: str = "当前屏幕文字"):
+        """Replace the volatile visible-text snapshot with the latest observation."""
+        self.ui.visible_texts = StateField("visible_texts")
+        self.ui.visible_texts.add_evidence(source, list(texts), note)
 
     def set_application(self, name: str, field: str, value: Any,
                         source: str = "default", note: str = ""):

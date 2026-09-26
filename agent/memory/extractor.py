@@ -49,7 +49,10 @@ class ExperienceExtractor:
         for item in trace:
             if item.get("is_failure"):
                 continue
-            action = _tool_to_action(item.get("tool", ""), item.get("args", {}))
+            tool_name = item.get("tool", "")
+            if tool_name in _ACT_TOOLS and not item.get("verified", False):
+                continue
+            action = _tool_to_action(tool_name, item.get("args", {}))
             if action not in steps:
                 steps.append(action)
         return steps[:10]

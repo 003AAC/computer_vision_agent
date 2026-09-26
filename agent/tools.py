@@ -7,11 +7,23 @@ import json
 import subprocess
 import time
 import ctypes
+import os
+
+# Make Win32 and screenshot coordinates use the same DPI space.
+if os.name == "nt":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
 
 import pyautogui
 import pyperclip
 from langchain_core.tools import tool
 
+from agent.action_result import action_result
 from vision.engine import (
     scan_screen, scan_region, scan_grid,
     locate_element, locate_in_region,
@@ -141,7 +153,11 @@ def _win32_set_cursor_pos(x: int, y: int):
 def _win32_mouse_click(button: str = "left"):
     """使用 Win32 API 发送真实鼠标点击事件"""
     if not WIN32_AVAILABLE:
-        pyautogui.click()
+        pyautogui.click(
+            button="right" if button == "right" else "left",
+            clicks=2 if button == "double" else 1,
+            interval=0.05,
+        )
         return
 
     if button == "double":
@@ -462,6 +478,16 @@ def click_at(x: int, y: int, button: str = "left") -> str:
     先用 visual_locate() 或 visual_locate_region() 获取坐标，再用此工具点击。"""
     try:
         target_x, target_y = int(x), int(y)
+        if button not in ("left", "right", "double"):
+            return action_result("click_at", "failed", f"不支持的鼠标按键: {button}")
+
+        screen_width, screen_height = pyautogui.size()
+        if not (0 <= target_x < screen_width and 0 <= target_y < screen_height):
+            return action_result(
+                "click_at", "failed",
+                f"目标坐标超出屏幕范围: ({target_x}, {target_y}), "
+                f"屏幕尺寸: {screen_width}x{screen_height}",
+            )
 
         # 移动鼠标（Win32 API 优先，失败自动回退 pyautogui）
         _win32_set_cursor_pos(target_x, target_y)
@@ -476,16 +502,20 @@ def click_at(x: int, y: int, button: str = "left") -> str:
         else:
             after = pyautogui.position()
 
-        result = f"✅ 已点击 ({target_x}, {target_y}) {'双击' if button == 'double' else '右键' if button == 'right' else '左键'}"
+        detail = (
+            f"点击事件已发送到 ({target_x}, {target_y}) "
+            f"({'双击' if button == 'double' else '右键' if button == 'right' else '左键'}); "
+            "界面效果尚未验证"
+        )
 
         # 防误报检测：如果鼠标实际位置偏离目标太多，标记警告
         if abs(after[0] - target_x) > 50 or abs(after[1] - target_y) > 50:
-            result += f" [注意：鼠标可能被拦截，实际位置({after[0]},{after[1]})]"
+            detail += f"；鼠标可能被拦截，实际位置({after[0]},{after[1]})"
 
-        return result
+        return action_result("click_at", "dispatched", detail)
 
     except Exception as e:
-        return f"点击失败: {str(e)}"
+        return action_result("click_at", "failed", f"点击事件发送失败: {e}")
 
 
 @tool
@@ -515,9 +545,13 @@ def drag_mouse(start_x: int, start_y: int, end_x: int, end_y: int, duration: flo
             time.sleep(0.1)
             pyautogui.drag(int(end_x) - int(start_x), int(end_y) - int(start_y), duration=float(duration))
 
-        return f"✅ 已从 ({start_x}, {start_y}) 拖拽到 ({end_x}, {end_y})"
+        return action_result(
+            "drag_mouse", "dispatched",
+            f"拖拽事件已发送: ({start_x}, {start_y}) -> ({end_x}, {end_y}); "
+            "界面效果尚未验证",
+        )
     except Exception as e:
-        return f"拖拽失败: {str(e)}"
+        return action_result("drag_mouse", "failed", f"拖拽事件发送失败: {e}")
 
 
 # ============================================================
@@ -530,9 +564,12 @@ def type_text(text: str) -> str:
     try:
         _win32_send_text(text)
         display = text[:50] + ('...' if len(text) > 50 else '')
-        return f"✅ 已输入: [{display}]"
+        return action_result(
+            "type_text", "dispatched",
+            f"输入事件已发送: [{display}]; 输入效果尚未验证",
+        )
     except Exception as e:
-        return f"输入失败: {str(e)}"
+        return action_result("type_text", "failed", f"输入事件发送失败: {e}")
 
 
 @tool
@@ -542,9 +579,12 @@ def press_key(key: str) -> str:
           'win', 'alt', 'ctrl', 'shift', 'up', 'down', 'left', 'right' 等。"""
     try:
         _win32_send_key(key)
-        return f"✅ 已按下 {key}"
+        return action_result(
+            "press_key", "dispatched",
+            f"按键事件已发送: {key}; 操作效果尚未验证",
+        )
     except Exception as e:
-        return f"按键失败: {str(e)}"
+        return action_result("press_key", "failed", f"按键事件发送失败: {e}")
 
 
 @tool
@@ -552,9 +592,12 @@ def hotkey(keys: list) -> str:
     """【组合键】按下键盘组合键。如 ['ctrl', 'c'], ['win', 'd'], ['alt', 'tab'], ['win', 'r']。"""
     try:
         _win32_multi_key(keys)
-        return f"✅ 已按下 {'+'.join(keys)}"
+        return action_result(
+            "hotkey", "dispatched",
+            f"组合键事件已发送: {'+'.join(keys)}; 操作效果尚未验证",
+        )
     except Exception as e:
-        return f"组合键失败: {str(e)}"
+        return action_result("hotkey", "failed", f"组合键事件发送失败: {e}")
 
 
 # ============================================================
@@ -656,16 +699,21 @@ def run_powershell(command: str) -> str:
     try:
         import base64
         encoded = base64.b64encode(command.encode('utf-16-le')).decode('ascii')
-        full_cmd = f'powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}'
+        full_cmd = [
+            "powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-EncodedCommand", encoded,
+        ]
 
         if command.strip().lower().startswith('start-process ') or command.strip().lower().startswith('start '):
-            proc = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(
+                full_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
             time.sleep(0.5)
             if proc.poll() is None:
                 return "命令执行成功（GUI程序已启动）"
             return f"命令执行成功（退出码: {proc.returncode}）" if proc.returncode == 0 else f"命令执行失败，退出码: {proc.returncode}"
 
-        result = subprocess.run(full_cmd, shell=True, capture_output=True, timeout=15)
+        result = subprocess.run(full_cmd, capture_output=True, timeout=15)
         output = _decode_bytes(result.stdout).strip()
         error = _decode_bytes(result.stderr).strip()
 

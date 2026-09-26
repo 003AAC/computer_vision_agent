@@ -4,7 +4,7 @@ Skill 系统基类 - Base Skill
 为不同应用场景定义专属技能（goal / available_tools / strategy / verification）。
 
 设计原则：
-  - Skill 只**约束/引导** LLM 的工具选择，不替换 LLM 决策
+  - Skill 为工具选择提供推荐，不作为执行权限白名单
   - Skill 匹配失败 → 回退到通用探索模式（不崩溃）
   - 每个 Skill 定义领域专属的：
     - goal: 目标描述
@@ -85,10 +85,8 @@ class BaseSkill:
 
     @classmethod
     def is_tool_allowed(cls, tool_name: str) -> bool:
-        """工具是否在技能允许范围内（None=全部允许）"""
-        if cls.available_tools is None:
-            return True
-        return tool_name in cls.available_tools
+        """Skills guide tool choice but do not block task-required actions."""
+        return True
 
 
 def get_base_skills() -> List[type]:

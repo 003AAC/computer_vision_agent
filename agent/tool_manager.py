@@ -7,11 +7,11 @@ Tool Manager - 工具调用策略管理器
   1. analyze_task(task) → 推荐任务分类 + 建议工具集
   2. execute_with_strategy(tool, args, task_type) → 执行 + 记录统计
   3. 记录每个工具在不同任务类型下的成功率，供后续推荐参考
-  4. 防止"用 DINO 做 OCR / 用 CLIP 做定位"等错配
+  4. 提示并减少"用 DINO 做 OCR / 用 CLIP 做定位"等错配
 
 设计原则：
   - 保持现有 ALL_TOOLS / TOOL_REGISTRY 不变（LLM 仍可直接调用）
-  - ToolManager 是**推荐的增强层**，提供建议但不强制
+  - ToolManager 是**建议与统计层**，不替代执行结果验证，也不强制拦截调用
   - 统计持久化到 agent/memories/tool_stats.json
 """
 import json

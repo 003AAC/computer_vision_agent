@@ -109,26 +109,29 @@ class WorkingMemory:
         return last_action
 
     def update_after_action(self, tool_name: str, args: Dict[str, Any],
-                            result_str: str, success: bool):
+                            result_str: str, success: bool = None,
+                            verified: bool = None):
         """动作执行后更新（更新 last_action.result + 记忆置信度）
 
         Args:
             tool_name: 工具名
             args: 工具参数
             result_str: 工具返回结果
-            success: 是否执行成功
+            success: 兼容旧调用的执行成功标记
+            verified: 动作效果是否有观察证据；None 表示尚未验证
         """
         if self._data["last_action"] is None:
             self.record_action(tool_name, args, result_str)
         else:
             self._data["last_action"]["result"] = result_str[:200]
-            self._data["last_action"]["success"] = success
+            self._data["last_action"]["execution_success"] = success
+            self._data["last_action"]["verified"] = verified
             self._data["last_action"]["timestamp"] = time.time()
 
-        # 动作成功 → 置信度小幅提升；失败 → 降低
-        if success:
+        # Only verified effects should increase confidence.
+        if verified is True:
             self._data["confidence"] = min(1.0, self._data["confidence"] + 0.05)
-        else:
+        elif verified is False:
             self._data["confidence"] = max(0.0, self._data["confidence"] - 0.1)
 
     def set_expected_transition(self, after_state: str,

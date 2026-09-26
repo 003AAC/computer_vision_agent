@@ -11,12 +11,15 @@ Agent 主循环
 """
 import json
 import time
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
 
 from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, MAX_STEPS
 from agent.tools import ALL_TOOLS, TOOL_REGISTRY
+from agent.action_result import annotate_action_result
+from agent.powershell_policy import requires_powershell_confirmation
+from agent.tool_policy import requires_sequential_execution
 from agent.state_machine import AgentStateMachine, AgentState
 from agent.exception_handler import ExceptionHandler
 from agent.memory.memory_manager import MemoryManager
@@ -167,10 +170,11 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
 2. entry_conditions 是**屏幕真实会出现的文字**（如 "开始游戏"、"Play"、"单人游戏"、"确定"、应用标题栏文字），
    必须能被 OCR 直接识别到的实际屏幕文字。**禁止使用抽象概念描述**（如 "桌面图标"、"游戏主菜单"、"界面已打开"），
    因为 OCR 无法匹配这些抽象词。若某阶段确实无文字证据，请写该阶段窗口/按钮上的具体文字。
-3. allowed_actions 从这些工具中选择：visual_scan, visual_scan_region, visual_scan_grid, visual_locate, visual_locate_region, visual_read_text, visual_read_region, visual_find_text, click_at, drag_mouse, type_text, press_key, hotkey, run_powershell, wait
+3. allowed_actions 是阶段推荐工具，不是硬性白名单。每个需要界面交互的阶段都应包含 click_at / press_key 等必要动作工具；若任务当前步骤需要点击，不得因阶段列表未列出而拒绝点击。
 4. goal-spec 的 evidence 是可独立验证的**屏幕特征**（用于验收，禁止依赖执行过程）。
    evidence 同样必须是**屏幕真实文字**（如 "开始游戏"、"Play"、游戏标题文字），禁止抽象描述。
-5. 只输出 <plan> 和 <goal> 块，不要其他解释文字。
+5. goal-spec.evidence 至少包含一条可由当前状态独立确认的证据；不能仅用“命令执行成功/已点击”等执行回执作为证据。
+6. 只输出 <plan> 和 <goal> 块，不要其他解释文字。
 """
 
     try:
@@ -194,6 +198,14 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
             except Exception as e:
                 print(f"  [规划] 阶段解析跳过: {e}")
         parsed["phases"] = phases
+        goal_spec = parsed.get("goal_spec")
+        if (
+            not isinstance(goal_spec, dict)
+            or not isinstance(goal_spec.get("evidence"), list)
+            or not any(str(item).strip() for item in goal_spec["evidence"])
+        ):
+            parsed.pop("goal_spec", None)
+            print("  [规划] 验收规格缺少独立证据，不能用于完成判定")
         parsed["raw"] = content
 
         # 校验：至少应有阶段或 goal
@@ -370,6 +382,10 @@ def _extract_ocr_texts(result_str: str) -> List[str]:
                 txt = t.get("text", "")
                 if txt:
                     texts.append(txt)
+            texts.extend(
+                str(text) for text in data.get("observed_texts", [])
+                if text
+            )
             # 视觉扫描的元素 label
             for e in data.get("elements", []):
                 label = e.get("label", "")
@@ -380,8 +396,11 @@ def _extract_ocr_texts(result_str: str) -> List[str]:
             if scene:
                 texts.append(scene)
     except (json.JSONDecodeError, TypeError):
-        # 非 JSON（如 visual_find_text 的文本返回）
-        pass
+        # visual_find_text returns a human-readable result rather than JSON.
+        import re
+        match = re.search(r"OCR 找到文字\[(.*?)\]", result_str)
+        if match:
+            texts.append(match.group(1))
     return texts
 
 
@@ -429,7 +448,9 @@ def _auto_predict_from_phase(task_phase: TaskPhaseMachine,
 
 def _drive_phase_transition(task_phase: TaskPhaseMachine,
                             working_memory: WorkingMemory,
-                            observed_texts: List[str]) -> Optional[str]:
+                            observed_texts: List[str],
+                            world_mgr: WorldStateManager = None,
+                            memory_manager: MemoryManager = None) -> Optional[str]:
     """用观察证据驱动任务阶段转换，并同步工作记忆"""
     if not observed_texts:
         return None
@@ -441,6 +462,15 @@ def _drive_phase_transition(task_phase: TaskPhaseMachine,
         # ⚡ StateManager: 同步分层世界状态（current_stage）
         if hasattr(working_memory, 'set_stage'):
             working_memory.set_stage(new_phase)
+        if world_mgr is not None and world_mgr.active:
+            world_mgr.set_task_stage(new_phase)
+        if memory_manager is not None:
+            phase = task_phase.get_phase(new_phase)
+            next_goal = (
+                phase.description or ", ".join(phase.entry_conditions)
+                if phase else new_phase
+            )
+            memory_manager.update_runtime(state=new_phase, next_goal=next_goal)
     return new_phase
 
 
@@ -451,6 +481,8 @@ def _run_prediction_closure(
     tool_name: str,
     tool_args: Dict[str, Any],
     llm_content: str,
+    pre_action_texts: List[str] = None,
+    pre_observation_valid: bool = False,
 ) -> Dict[str, Any]:
     """动作预测闭环：predict → wait → observe → compare → classify
 
@@ -467,20 +499,16 @@ def _run_prediction_closure(
     if tool_name not in WorkingMemory.ACTION_TOOLS:
         return {"prediction_made": False, "result": None, "classification": "ok"}
 
-    # 预测来源 1：LLM <predict> 块
+    # Every state-changing action gets a fresh observation, even without a prediction.
     predict_data = _parse_predict_block(llm_content or "")
     source = "llm"
     # 预测来源 2：任务阶段兜底
     if not predict_data:
         predict_data = _auto_predict_from_phase(task_phase, working_memory)
         source = "phase"
-    if not predict_data:
-        # 无预测 → 仍记录动作，但不等待
-        return {"prediction_made": False, "result": None, "classification": "ok"}
-
-    predicted_state = predict_data.get("next_state", "")
+    predicted_state = predict_data.get("next_state", "") if predict_data else ""
     should_appear = predict_data.get("should_appear", [])
-    timeout = float(predict_data.get("timeout", 3.0))
+    timeout = float(predict_data.get("timeout", 3.0)) if predict_data else 3.0
 
     # 过滤抽象描述（OCR 无法匹配的"概念词"），避免无意义空等 25s
     # 例: "桌面图标"、"游戏主菜单"、"界面已打开" —— 屏幕不会显示这些字
@@ -512,65 +540,92 @@ def _run_prediction_closure(
             filtered_appear.append(s)
     should_appear = filtered_appear
 
-    # 建立预测
-    pred = predictor.predict(
-        action=tool_name,
-        args=tool_args,
-        predicted_state=predicted_state,
-        should_appear=should_appear,
-        timeout=timeout,
-        source=source,
-    )
-
-    # 同步工作记忆
-    working_memory.set_prediction(predicted_state, timeout)
-    if should_appear:
-        working_memory.set_expected_transition(
-            predicted_state, should_appear, timeout
+    pred = None
+    if predict_data:
+        pred = predictor.predict(
+            action=tool_name,
+            args=tool_args,
+            predicted_state=predicted_state,
+            should_appear=should_appear,
+            timeout=timeout,
+            source=source,
+            match_any=source == "phase",
         )
+        working_memory.set_prediction(predicted_state, timeout)
+        if should_appear:
+            working_memory.set_expected_transition(
+                predicted_state, should_appear, timeout
+            )
 
-    print(f"  [预测] {tool_name} → {predicted_state or '状态变化'} "
-          f"(应出现: {', '.join(should_appear) or '无'})")
+        print(f"  [预测] {tool_name} → {predicted_state or '状态变化'} "
+              f"(应出现: {', '.join(should_appear) or '无'})")
 
-    # 预测有 should_appear → 等待并观察
-    # 若无有效期望（全被抽象过滤），跳过观察避免空等
-    observed_texts = []
     wait_result = None
     if should_appear:
         wait_result = predictor.wait_and_observe(pred)
-        observed_texts = predictor.observe()
+        observed_texts = wait_result["observed_texts"]
+        post_observation_valid = wait_result.get("observation_valid", True)
         print(f"  [观察] 匹配={wait_result.get('found', [])} "
               f"未匹配={wait_result.get('missed', [])} "
               f"耗时={wait_result.get('elapsed', 0)}s")
     else:
-        # 无有效期望 → 视为观察通过（不阻塞）
-        wait_result = {
-            "matched": True, "found": [], "missed": [],
-            "elapsed": 0.0, "observation_count": 0,
-        }
-        observed_texts = []
+        observed_texts, post_observation_valid = predictor.observe_with_status()
+        if predict_data:
+            wait_result = {
+                "matched": False, "found": [], "missed": [],
+                "elapsed": 0.0, "observation_count": 1,
+                "observed_texts": observed_texts,
+                "observation_valid": post_observation_valid,
+            }
 
-    # 对比预测 vs 观察（含阶段匹配）
-    compare_result = predictor.compare(pred, observed_phase=task_phase.current_phase)
-    classification = predictor.classify_failure(compare_result, tool_name)
+    compare_result = None
+    classification = "ok"
+    verification_status = "unverified"
+    if pred is not None and should_appear:
+        # The current phase is the pre-action phase; do not compare it with the
+        # predicted next phase before evidence has driven a phase transition.
+        compare_result = predictor.compare(
+            pred, observed_phase="", ocr_texts=observed_texts
+        )
+        classification = predictor.classify_failure(compare_result, tool_name)
+        if wait_result and wait_result.get("matched"):
+            before = set(predictor.matched_conditions(should_appear, pre_action_texts or []))
+            after = set(predictor.matched_conditions(should_appear, observed_texts))
+            newly_observed = after - before
+            verification_status = (
+                "verified" if pre_observation_valid and newly_observed
+                else "unverified"
+            )
+            if not pre_observation_valid:
+                classification = "baseline_observation_unavailable"
+            elif verification_status == "unverified":
+                classification = "expected_evidence_preexisted"
+        elif not post_observation_valid:
+            verification_status = "unverified"
+            classification = "post_observation_unavailable"
+        else:
+            verification_status = "failed"
 
     # 更新工作记忆
-    if wait_result and wait_result.get("matched"):
+    if verification_status == "verified":
         working_memory.update_state_after_observation(predicted_state, 0.8)
-    else:
+    elif verification_status == "failed":
         working_memory.update(note=f"预测未匹配: {classification}")
 
     # 预测结果结构化输出（供日志）
     return {
-        "prediction_made": True,
-        "prediction": pred.to_dict(),
+        "prediction_made": pred is not None,
+        "prediction": pred.to_dict() if pred is not None else None,
         "observe_result": wait_result,
         "result": compare_result,
         "classification": classification,
+        "verification_status": verification_status,
+        "observed_texts": observed_texts,
     }
 
 
-def run_task(client, tools_schema, user_query: str):
+def run_task(client, tools_schema, user_query: str,
+             confirm_powershell: Callable[[str], bool] = None):
     """执行单个任务（内部循环，接入状态感知机 + 异常处理 + 闭环智能体）"""
     # ============================================================
     # 初始化：状态感知机 + 异常处理器 + 知识库 + 闭环智能体模块
@@ -631,6 +686,11 @@ def run_task(client, tools_schema, user_query: str):
     if phases:
         task_phase = TaskPhaseMachine(phases=phases, start_phase=initial_state or "EXPLORING")
         print("  [阶段] 已应用任务阶段机")
+    memory_manager.update_runtime(
+        state=task_phase.current_phase,
+        next_goal=task_phase.get_phase(task_phase.current_phase).description
+        if task_phase.get_phase(task_phase.current_phase) else user_query,
+    )
 
     # 应用规划：验收规格
     goal_spec_dict = plan_result.get("goal_spec")
@@ -641,6 +701,7 @@ def run_task(client, tools_schema, user_query: str):
     # ⚡ WorldState: 创建任务世界状态
     try:
         world_mgr.create(user_query)
+        world_mgr.set_task_stage(task_phase.current_phase)
         world_before_dict = world_mgr.to_dict()
         print("  [世界状态] 已创建任务世界模型")
     except Exception as e:
@@ -686,7 +747,6 @@ def run_task(client, tools_schema, user_query: str):
         print(f"  [记忆] 抽象经验注入跳过: {e}")
 
     # 注入 Skill 技能指令（领域策略引导）
-    active_skill = None
     try:
         skill_classes = get_base_skills()
         skill_ctx = build_skill_instruction(user_query, skill_classes)
@@ -695,25 +755,16 @@ def run_task(client, tools_schema, user_query: str):
             from skills.base import select_skill
             skill_cls = select_skill(user_query, skill_classes)
             if skill_cls is not None:
-                active_skill = skill_cls
                 print(f"  [技能] 已匹配并注入 [{skill_cls.name}] 领域技能")
     except Exception as e:
         print(f"  [技能] 技能注入跳过: {e}")
 
-    # ⚡ WorldState: 注入初始世界状态摘要（messages 已定义）
-    try:
-        ws_summary = world_mgr.to_summary()
-        if ws_summary:
-            messages.append({"role": "system", "content": ws_summary})
-    except Exception as e:
-        print(f"  [世界状态] 摘要注入跳过: {e}")
-
-    # ⚡ Skill 约束：工具越权检查在工具调用时用 active_skill.is_tool_allowed()
     success = False
     final_result = ""
     steps_taken = 0
     all_tools_used = []
     recent_tool_results = []
+    completion_rejections = 0
 
     for step in range(1, MAX_STEPS + 1):
         steps_taken = step
@@ -746,6 +797,14 @@ def run_task(client, tools_schema, user_query: str):
                     "或使用 visual_find_text() 定位目标。"
                 ),
             })
+        elif state_payload["consecutive_failures"] >= 2:
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"【失败警告】已连续 {state_payload['consecutive_failures']} 步执行失败。"
+                    "请先检查最新观察和失败原因，改变策略，不要照原参数重复操作。"
+                ),
+            })
 
         # ============================================================
         # 状态动态注入：让 LLM 感知最新工作记忆 + 任务阶段
@@ -758,10 +817,17 @@ def run_task(client, tools_schema, user_query: str):
             state_inject.append(wm_ins)
         if tp_ins:
             state_inject.append(tp_ins)
+        runtime_ins = memory_manager.get_runtime_instruction()
+        if runtime_ins:
+            state_inject.append(runtime_ins)
         # 只在本轮有状态变化时注入（简化：每轮都注入最新状态，但控制大小）
         if state_inject:
             msg_content = "\n\n".join(state_inject)
             messages.append({"role": "system", "content": msg_content})
+        if world_mgr.active:
+            ws_summary = world_mgr.to_summary()
+            if ws_summary:
+                messages.append({"role": "system", "content": ws_summary})
 
         # ============================================================
         # API 调用（带异常兜底：BadRequest / 网络错误 / 超时）
@@ -788,16 +854,46 @@ def run_task(client, tools_schema, user_query: str):
             # ============================================================
             # 工具调用处理
             # ============================================================
-            scan_tools = {"visual_scan", "visual_scan_region", "visual_scan_grid",
-                          "visual_locate", "visual_locate_region"}
             action_tools = {"click_at", "drag_mouse", "type_text", "press_key",
                             "hotkey", "run_powershell"}
-            has_scan_only = all(tc.function.name in scan_tools for tc in msg.tool_calls)
-            has_action = any(tc.function.name in action_tools for tc in msg.tool_calls)
+
+            # Tool-call arguments are all chosen before any result in this batch
+            # is returned. Never execute a precomputed action after another call.
+            if requires_sequential_execution(
+                (tc.function.name for tc in msg.tool_calls), action_tools
+            ):
+                reason = (
+                    "本批工具调用未执行：包含动作工具的调用必须单独发出，"
+                    "以便下一步基于最新观察结果决策。请一次只调用一个动作工具。"
+                )
+                names = [tc.function.name for tc in msg.tool_calls]
+                for tc in msg.tool_calls:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": reason,
+                    })
+                    recent_tool_results.append(reason)
+                exec_logger.log_info(
+                    "Rejected multi-tool batch containing a state-changing action",
+                    tools=names,
+                )
+                state_machine.record_step(names, has_progress=False, is_failure=False)
+                exec_logger.record_step({
+                    "step": step,
+                    "task_phase": task_phase.current_phase,
+                    "agent_state": state_machine.get_status_payload(),
+                    "tools": [],
+                    "rejected_tools": names,
+                    "has_progress": False,
+                    "is_failure": False,
+                })
+                continue
 
             tool_names_in_step = []
             has_step_failure = False
-            has_step_progress = has_action
+            has_step_progress = False
+            observed_texts = []
             pending_fix_instructions = []  # 修复指令延迟注入，保证 assistant→tool 协议顺序
 
             for tc in msg.tool_calls:
@@ -811,48 +907,120 @@ def run_task(client, tools_schema, user_query: str):
                 print(f"[Step {step}|{tier_label.get(current_tier, '?')}] "
                       f"{tool_name}({json.dumps(tool_args, ensure_ascii=False)})")
 
-                tool_result = "未知工具"
-                for t in ALL_TOOLS:
-                    if t.name == tool_name:
-                        tool_result = t.invoke(tool_args)
-                        break
+                pre_action_texts, pre_observation_valid = (
+                    predictor.observe_with_status()
+                    if tool_name in {
+                        "click_at", "drag_mouse", "type_text", "press_key", "hotkey"
+                    }
+                    else ([], False)
+                )
+                safety_rejection = False
+                if tool_name not in TOOL_REGISTRY:
+                    tool_result = "工具不存在，执行失败"
+                elif tool_name == "run_powershell" and requires_powershell_confirmation(
+                    str(tool_args.get("command", ""))
+                ):
+                    command = str(tool_args.get("command", ""))
+                    approved = bool(confirm_powershell and confirm_powershell(command))
+                    if not approved:
+                        tool_result = "安全策略拒绝执行该 PowerShell 命令"
+                        safety_rejection = True
+                    else:
+                        execution = tool_manager.execute_with_strategy(
+                            TOOL_REGISTRY[tool_name], tool_args, user_query, tool_name
+                        )
+                        tool_result = execution["result"]
                 else:
-                    # 工具不在 ALL_TOOLS，尝试注册表
-                    if tool_name in TOOL_REGISTRY:
-                        tool_result = TOOL_REGISTRY[tool_name].invoke(tool_args)
+                    execution = tool_manager.execute_with_strategy(
+                        TOOL_REGISTRY[tool_name], tool_args, user_query, tool_name
+                    )
+                    tool_result = execution["result"]
 
                 all_tools_used.append(tool_name)
                 tool_names_in_step.append(tool_name)
                 result_str = str(tool_result)
+                raw_result_str = result_str
                 display = result_str[:200] + "..." if len(result_str) > 200 else result_str
                 print(f"  <- {display}")
 
-                # ⚡ 结构化日志：记录工具调用明细（此前缺失，导致 JSONL 无执行轨迹）
-                try:
-                    exec_logger.log_action(tool_name, tool_args, result_str,
-                                           success=not exception_handler.is_success(result_str))
-                except Exception:
-                    pass
-
                 # ⚡ 工作记忆：记录动作（动作前更新 last_action）
-                working_memory.record_action(tool_name, tool_args)
+                if tool_name in action_tools:
+                    working_memory.record_action(tool_name, tool_args)
 
                 # ⚡ 动作预测闭环（仅动作类工具；感知工具跳过）
                 prediction_ctx = _run_prediction_closure(
                     predictor, task_phase, working_memory,
                     tool_name, tool_args,
                     llm_content=msg.content or "",
+                    pre_action_texts=pre_action_texts,
+                    pre_observation_valid=pre_observation_valid,
                 )
+                observed_texts.extend(prediction_ctx.get("observed_texts", []))
                 if prediction_ctx.get("prediction_made"):
-                    exec_logger.log_prediction(prediction_ctx.get("prediction", {}))
+                    exec_logger.log_prediction({
+                        "prediction": prediction_ctx.get("prediction"),
+                        "pre_action_texts": pre_action_texts,
+                        "pre_observation_valid": pre_observation_valid,
+                        "observed_texts": prediction_ctx.get("observed_texts", []),
+                        "verification_status": prediction_ctx.get(
+                            "verification_status", "unverified"
+                        ),
+                        "result": prediction_ctx.get("result"),
+                    })
                     if prediction_ctx.get("classification", "ok") != "ok":
                         # 预测失败 → 注入提醒给 LLM（但当前轮不能打断协议序列，延迟注入）
                         classification = prediction_ctx.get("classification")
-                        pending_fix_instructions.append(
-                            f"【预测验证】动作 {tool_name} 后的预期未出现 "
-                            f"(分类: {classification})。"
-                            f"请观察当前屏幕状态，判断是否需要重试、关闭弹窗或换方案。"
-                        )
+                        if classification == "expected_evidence_preexisted":
+                            pending_fix_instructions.append(
+                                f"【效果未确认】预期证据在 {tool_name} 执行前已经存在；"
+                                "不能据此认定动作生效。请重新评估当前阶段，"
+                                "并选择一个动作后可观察的新状态证据。"
+                            )
+                        elif classification == "baseline_observation_unavailable":
+                            pending_fix_instructions.append(
+                                f"【效果未确认】动作 {tool_name} 前的屏幕观察不可用；"
+                                "当前只能确认事件已发送。请先重新观察，再判断后续操作。"
+                            )
+                        elif classification == "post_observation_unavailable":
+                            pending_fix_instructions.append(
+                                f"【效果未确认】动作 {tool_name} 后的屏幕观察不可用；"
+                                "不能据此认定动作失败或成功。请重新观察当前界面后再决策。"
+                            )
+                        else:
+                            pending_fix_instructions.append(
+                                f"【预测验证】动作 {tool_name} 后的预期未出现 "
+                                f"(分类: {classification})。"
+                                "请观察当前屏幕状态，判断是否需要重试或换方案。"
+                            )
+
+                verification_status = prediction_ctx.get(
+                    "verification_status", "unverified"
+                )
+                if tool_name in action_tools and not exception_handler.is_success(result_str):
+                    verification_status = "failed"
+                result_str = annotate_action_result(
+                    result_str,
+                    verification_status,
+                    prediction_ctx.get("observed_texts", []),
+                )
+                if tool_name in action_tools and not parse_action_result(result_str):
+                    if verification_status == "failed":
+                        result_str += "\n操作效果验证失败：预测的界面证据未出现。"
+                    elif verification_status == "unverified":
+                        result_str += "\n操作已发送，但效果尚无可判定的验证证据。"
+                if verification_status == "verified":
+                    has_step_progress = True
+
+                if tool_name in action_tools:
+                    working_memory.update_after_action(
+                        tool_name, tool_args, result_str,
+                        success=not safety_rejection and exception_handler.is_success(raw_result_str),
+                        verified=(
+                            True if verification_status == "verified"
+                            else False if verification_status == "failed"
+                            else None
+                        ),
+                    )
 
                 # ⚡ 视觉对象记忆：点击动作失效被点击目标
                 if tool_name == "click_at":
@@ -865,16 +1033,24 @@ def run_task(client, tools_schema, user_query: str):
                 execution_trace.append({
                     "tool": tool_name,
                     "args": tool_args,
-                    "is_failure": not exception_handler.is_success(result_str),
+                    "is_failure": (
+                        safety_rejection
+                        or not exception_handler.is_success(result_str)
+                    ),
+                    "verified": verification_status == "verified",
                 })
 
                 # 失败检测（统一失败检测器）
-                is_failure = not exception_handler.is_success(result_str)
+                is_failure = (
+                    safety_rejection
+                    or not exception_handler.is_success(result_str)
+                )
                 if is_failure:
                     has_step_failure = True
                     tier_failures += 1
                     # ⚡ StateManager: 记录失败/重试计数
-                    if hasattr(working_memory, 'record_failure'):
+                    if (tool_name not in action_tools
+                            and hasattr(working_memory, 'record_failure')):
                         working_memory.record_failure()
                     print(f"  [!] 失败 ({tier_label.get(current_tier, '?')} "
                           f"失败 {tier_failures}/{max_tier_attempts})")
@@ -891,7 +1067,7 @@ def run_task(client, tools_schema, user_query: str):
 
                     if failure_report["should_degrade"]:
                         print(f"  [智能降级建议] {failure_report['degrade_suggestion']}")
-                else:
+                elif verification_status == "verified":
                     # ⚡ StateManager: 记录成功（重置失败/重试计数）
                     if hasattr(working_memory, 'record_success'):
                         working_memory.record_success()
@@ -899,16 +1075,11 @@ def run_task(client, tools_schema, user_query: str):
                         tier_failures = 0
                         print(f"  [OK] 成功，重置失败计数")
 
-                # ⚡ ToolManager: 工具使用建议 + 统计（延迟注入，保持协议有效）
+                # ⚡ ToolManager: 工具使用建议（调用统计在统一执行入口更新）
                 try:
                     advice = tool_manager.get_tool_advice(tool_name, user_query)
                     if advice:
                         pending_fix_instructions.append(advice)
-                    # 记录工具成功率统计
-                    from agent.tool_manager import infer_task_type
-                    tt = infer_task_type(user_query, tool_name)
-                    tool_manager.stats.record(tool_name, tt, not is_failure)
-                    tool_manager._save_stats()
                 except Exception:
                     pass
 
@@ -917,12 +1088,19 @@ def run_task(client, tools_schema, user_query: str):
                 llm_tool_content = result_str   # 默认完整结果（回退）
                 try:
                     if world_mgr.active:
+                        if prediction_ctx.get("observed_texts"):
+                            world_mgr.set_ui(
+                                "visible_texts",
+                                list(dict.fromkeys(prediction_ctx["observed_texts"])),
+                                source="ocr",
+                                note="动作后的实时全屏 OCR",
+                            )
                         # 记录本次状态快照
                         prev_state = world_mgr.to_dict()
 
                         # 1. 提取并应用证据更新（含 autowrite 客观事实）
-                        world_mgr.update_from_tool(tool_name, result_str, tool_args)
-                        world_mgr.autowrite_from_tool(tool_name, result_str, tool_args)
+                        world_mgr.update_from_tool(tool_name, raw_result_str, tool_args)
+                        world_mgr.autowrite_from_tool(tool_name, raw_result_str, tool_args)
 
                         # 2. 计算状态差异 → 语义摘要
                         cur_state = world_mgr.to_dict()
@@ -930,7 +1108,8 @@ def run_task(client, tools_schema, user_query: str):
                         semantic = diff_result.get("semantic_summary", "")
 
                         # 3. 产生压缩注入内容
-                        if semantic and semantic != "世界状态无变化":
+                        if (semantic and semantic != "世界状态无变化"
+                                and tool_name not in action_tools):
                             # 语义摘要有效 → 用它替换原始结果，节省 token
                             llm_tool_content = (
                                 f"[工具执行结果已压缩为世界状态更新]\n"
@@ -945,6 +1124,27 @@ def run_task(client, tools_schema, user_query: str):
                     # 压缩失败 → 回退原样直送（不崩溃、不丢信息）
                     print(f"  [世界状态] 压缩跳过: {e}")
 
+                if prediction_ctx.get("observed_texts"):
+                    if verification_status == "failed":
+                        status_message = "动作后的预期界面证据未出现，操作效果验证失败。"
+                    elif verification_status == "verified":
+                        status_message = "动作后的预期界面证据已观察到，操作效果验证通过。"
+                    else:
+                        status_message = "动作事件已发送，但没有足够的预期证据确认效果。"
+                    llm_tool_content += (
+                        f"\n\n{status_message}\n操作后实时 OCR 观察: "
+                        + json.dumps(prediction_ctx["observed_texts"], ensure_ascii=False)
+                    )
+
+                try:
+                    exec_logger.log_action(
+                        tool_name, tool_args, result_str,
+                        success=not is_failure,
+                        verification_status=verification_status,
+                    )
+                except Exception:
+                    pass
+
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": llm_tool_content})
                 recent_tool_results.append(result_str)
@@ -957,20 +1157,33 @@ def run_task(client, tools_schema, user_query: str):
             # 阶段转换（观察证据驱动）
             # 从工具结果中提取文字证据，驱动 TaskPhaseMachine 状态推进
             # ============================================================
-            observed_texts = []
             for r in recent_tool_results[-len(tool_names_in_step):]:
                 observed_texts.extend(_extract_ocr_texts(r))
             if observed_texts:
-                _drive_phase_transition(task_phase, working_memory, observed_texts)
+                transitioned = _drive_phase_transition(
+                    task_phase, working_memory, observed_texts,
+                    world_mgr, memory_manager,
+                )
+                if transitioned:
+                    has_step_progress = True
 
             # ============================================================
             # 状态机记录本步
             # ============================================================
             state_machine.record_step(
                 tool_names_in_step,
-                has_progress=has_step_progress or not has_step_failure,
+                has_progress=has_step_progress,
                 is_failure=has_step_failure,
             )
+            exec_logger.record_step({
+                "step": step,
+                "task_phase": task_phase.current_phase,
+                "agent_state": state_machine.get_status_payload(),
+                "tools": tool_names_in_step,
+                "observed_texts": list(dict.fromkeys(observed_texts)),
+                "has_progress": has_step_progress,
+                "is_failure": has_step_failure,
+            })
 
             # ============================================================
             # 层级降级检测（连续失败）
@@ -1010,8 +1223,15 @@ def run_task(client, tools_schema, user_query: str):
 
             # 状态机记录（无工具调用 = 无进展）
             state_machine.record_step([], has_progress=False, is_failure=False)
-            recent_tool_results.append(content)
-
+            exec_logger.record_step({
+                "step": step,
+                "task_phase": task_phase.current_phase,
+                "agent_state": state_machine.get_status_payload(),
+                "tools": [],
+                "assistant_text": content[:500],
+                "has_progress": False,
+                "is_failure": False,
+            })
             completion_signals = ["任务完成", "已完成", "完成", "done", "finished", "已成功", "成功完成", "结束"]
 
             # ============================================================
@@ -1052,8 +1272,14 @@ def run_task(client, tools_schema, user_query: str):
                     break
 
                 # 若 WorldState 有缺失证据（且已匹配任务模板）→ 注入缺失项给 LLM 继续
-                if ws_missing and not ws_accept and ws_has_template:
+                if ws_missing and not ws_accept and ws_has_template and not verifier.has_spec:
                     print(f"  [完成声明驳回] 世界状态缺失证据: {ws_missing}")
+                    completion_rejections += 1
+                    if completion_rejections >= 3:
+                        final_result = "任务无法确认完成：世界状态验收所需证据持续缺失"
+                        state_machine.mark_failed(final_result)
+                        print(f"\n  [失败] {final_result}")
+                        break
                     reject_msg = (
                         "【世界状态验收未通过】系统未找到以下客观证据：\n"
                         + "\n".join(f"  - {m}" for m in ws_missing)
@@ -1075,24 +1301,14 @@ def run_task(client, tools_schema, user_query: str):
                 verification_failed = False
                 if verifier.has_spec:
                     try:
-                        # 证据源1：OCR 全屏文字
-                        verify_texts = []
-                        try:
-                            from vision.ocr import ocr_screen
-                            ocr_data = json.loads(ocr_screen())
-                            verify_texts.extend(
-                                t.get("text", "") for t in ocr_data.get("texts", [])
-                            )
-                        except Exception:
-                            pass
-                        # 证据源2：最近工具结果文本（PowerShell 输出等，
-                        # 文件系统/命令类任务的证据在工具输出而非屏幕上）
-                        for r in recent_tool_results[-6:]:
-                            if isinstance(r, str) and r.strip():
-                                verify_texts.append(r)
-
+                        from vision.ocr import ocr_screen
+                        ocr_data = json.loads(ocr_screen())
+                        verify_texts = [
+                            t.get("text", "") for t in ocr_data.get("texts", [])
+                            if t.get("text")
+                        ]
                         verification = verifier.verify(
-                            ocr_texts=verify_texts if verify_texts else None
+                            ocr_texts=verify_texts
                         )
                         exec_logger.log_verification(verification)
                         if verification["verified"]:
@@ -1101,18 +1317,16 @@ def run_task(client, tools_schema, user_query: str):
                             verification_failed = True
                             print(f"  [独立验收] ❌ 未通过: {verification['reasons']}")
                     except Exception as e:
-                        print(f"  [独立验收] 验收异常跳过: {e}")
-                        verification_failed = False
+                        verification_failed = True
+                        print(f"  [独立验收] 验收异常，按未通过处理: {e}")
 
-                # 判定：伪成功 或 独立验收未通过 → 驳回完成声明
-                # ⚡ 驳回保护：连续验收失败 ≥3 次视为已尽力，强制接受完成声明，
-                #    避免"文件整理已成功但 OCR 验证不到"导致的无限死循环
-                reject_count = len(verifier.get_verify_history())
-                if verification_failed and reject_count >= 3:
-                    print(f"  [独立验收] ⚠️ 已连续驳回 {reject_count} 次，强制接受完成声明（防死循环）")
-                    verification_failed = False
+                verification_missing = not verifier.has_spec
 
-                is_rejected = validation["is_pseudo_success"] or verification_failed
+                is_rejected = (
+                    validation["is_pseudo_success"]
+                    or verification_failed
+                    or verification_missing
+                )
                 if is_rejected:
                     reasons = []
                     if validation["is_pseudo_success"]:
@@ -1121,14 +1335,33 @@ def run_task(client, tools_schema, user_query: str):
                         reasons.extend(verification["reasons"])
                     if verification_failed and (not verification or not verification.get("reasons")):
                         reasons.append("独立验收未找到目标证据")
+                    if verification_missing:
+                        if ws_has_template:
+                            reasons.append("世界状态验收未通过，且没有独立目标规格")
+                        else:
+                            reasons.append("当前任务没有可用的通过型独立验收证据")
 
                     print(f"  [完成声明驳回] {reasons}")
+                    completion_rejections += 1
+                    if completion_rejections >= 3:
+                        final_result = (
+                            "任务未标记为成功：连续验收未能获得独立完成证据。"
+                            + "; ".join(reasons)
+                        )
+                        state_machine.mark_failed(final_result)
+                        print(f"\n  [失败] {final_result}")
+                        break
                     reject_msg = "【完成声明审核】你的完成声明未通过："
                     if validation["is_pseudo_success"]:
                         reject_msg += f"执行过程存在异常（{'; '.join(validation['reasons'])}）；"
                     if verification_failed and verification:
                         reject_msg += f"独立验收未通过（{'; '.join(verification.get('reasons', []))}）。"
                         reject_msg += "请再执行一次验证步骤（如 visual_find_text / OCR），确认目标确实达成。"
+                    elif verification_missing:
+                        reject_msg += (
+                            "世界状态或目标验收尚未提供通过证据。请通过工具检查当前系统状态，"
+                            "不能把工具调用回执当作完成证据。"
+                        )
                     else:
                         reject_msg += "请再执行一次验证步骤（如 visual_find_text / OCR / PowerShell 检查）。"
                     messages.append({
@@ -1225,6 +1458,7 @@ def run_task(client, tools_schema, user_query: str):
         working_memory.clear()
         tracker.clear()
         verifier.clear()
+        memory_manager.runtime.clear()
     except Exception:
         pass
 
@@ -1287,7 +1521,10 @@ def run_agent(user_query: str = None):
 
     if user_query:
         try:
-            return run_task(client, tools_schema, user_query)
+            return run_task(
+                client, tools_schema, user_query,
+                confirm_powershell=_confirm_powershell_cli,
+            )
         except Exception as e:
             # 兜底：任何未捕获异常都不能让进程崩溃
             print(f"\n[致命错误] 任务执行异常: {e}")
@@ -1304,7 +1541,10 @@ def run_agent(user_query: str = None):
                 print("再见！")
                 break
 
-            run_task(client, tools_schema, query)
+            run_task(
+                client, tools_schema, query,
+                confirm_powershell=_confirm_powershell_cli,
+            )
 
         except KeyboardInterrupt:
             print("\n\n再见！")
@@ -1313,3 +1553,12 @@ def run_agent(user_query: str = None):
             print(f"\n[错误] {e}\n")
 
     return True, "正常退出"
+
+
+def _confirm_powershell_cli(command: str) -> bool:
+    if not sys.stdin.isatty():
+        print("  [安全] 非交互环境无法确认高风险命令，已拒绝执行。")
+        return False
+    print("\n[安全确认] 即将执行可能修改数据或系统设置的 PowerShell 命令:")
+    print(command)
+    return input("确认执行？输入 yes 继续，其它输入均拒绝: ").strip().lower() == "yes"

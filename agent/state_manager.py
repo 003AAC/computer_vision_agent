@@ -108,14 +108,17 @@ class StateManager:
         return self.wm.record_action(tool_name, args, result_str)
 
     def update_after_action(self, tool_name: str, args: Dict[str, Any],
-                            result_str: str, success: bool):
+                            result_str: str, success: bool = None,
+                            verified: bool = None):
         """透传 + 更新失败/重试计数"""
-        self.wm.update_after_action(tool_name, args, result_str, success)
-        if success:
+        self.wm.update_after_action(
+            tool_name, args, result_str, success=success, verified=verified
+        )
+        if verified is True:
             # 成功 → 重置计数
             self._failure_count = 0
             self._retry_count = 0
-        else:
+        elif verified is False:
             self._failure_count += 1
             self._retry_count += 1
 

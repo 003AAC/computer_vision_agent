@@ -37,6 +37,7 @@ class Prediction:
         should_appear: List[str] = None,
         timeout: float = 3.0,
         source: str = "llm",
+        match_any: bool = False,
     ):
         self.action = action
         self.args = dict(args)
@@ -44,6 +45,7 @@ class Prediction:
         self.should_appear = should_appear or []
         self.timeout = timeout
         self.source = source
+        self.match_any = match_any
         self.timestamp = time.time()
         self.result: Optional[Dict[str, Any]] = None
 
@@ -58,6 +60,7 @@ class Prediction:
             "should_appear": self.should_appear,
             "timeout": self.timeout,
             "source": self.source,
+            "match_any": self.match_any,
             "timestamp": self.timestamp,
         }
 
@@ -88,6 +91,7 @@ class ActionPredictor:
         should_appear: List[str] = None,
         timeout: float = 3.0,
         source: str = "llm",
+        match_any: bool = False,
     ) -> Prediction:
         """建立一次动作预测
 
@@ -103,7 +107,8 @@ class ActionPredictor:
             创建的 Prediction
         """
         pred = Prediction(
-            action, args, predicted_state, should_appear, timeout, source
+            action, args, predicted_state, should_appear, timeout, source,
+            match_any,
         )
         self._active.append(pred)
         if len(self._active) > self.MAX_PREDICTIONS:
@@ -137,13 +142,23 @@ class ActionPredictor:
         """
         if ocr_texts is not None:
             return ocr_texts
+        texts, _ = self.observe_with_status()
+        return texts
+
+    def observe_with_status(self) -> Tuple[List[str], bool]:
+        """Return screen text plus whether the OCR observation itself was valid."""
         try:
             result_json = ocr_screen()
             data = json.loads(result_json)
-            return [t.get("text", "") for t in data.get("texts", [])]
+            if not isinstance(data, dict) or data.get("error"):
+                return [], False
+            return [
+                t.get("text", "") for t in data.get("texts", [])
+                if t.get("text")
+            ], True
         except Exception as e:
             logger.warning(f"OCR 观察失败: {e}")
-            return []
+            return [], False
 
     def wait_and_observe(
         self,
@@ -175,19 +190,31 @@ class ActionPredictor:
               "observation_count": int
             }
         """
-        deadline = pred.timestamp + pred.timeout
         should_appear = pred.should_appear or []
 
         found: List[str] = []
         missed: List[str] = list(should_appear)
+        observed_texts: List[str] = []
         elapsed = 0.0
         observation_count = 0
+        observation_valid = True
 
         # 首次观察
         if should_appear:
-            first_obs = self.observe(ocr_texts)
+            if ocr_texts is not None:
+                first_obs = ocr_texts
+                observation_valid = True
+            else:
+                first_obs, observation_valid = self.observe_with_status()
+            if observation_valid:
+                observed_texts = first_obs
             observation_count += 1
-            found, missed = self._split_matches(should_appear, first_obs)
+            found, missed = self._split_matches(
+                should_appear, observed_texts, match_any=pred.match_any
+            )
+        # OCR itself can take longer than the intended UI wait. Start the
+        # response window after the first observation rather than consuming it.
+        deadline = time.time() + pred.timeout
 
         # 退避重扫（最多 MAX_OBSERVATIONS 次全屏 OCR，避免 CPU 无限刷屏）
         backoff = 0.5
@@ -195,10 +222,13 @@ class ActionPredictor:
                 and observation_count < self.MAX_OBSERVATIONS:
             time.sleep(backoff)
             backoff = min(backoff * 2, 4.0)
-            obs = self.observe()
+            obs, observation_valid = self.observe_with_status()
             observation_count += 1
-            if obs:
-                found, missed = self._split_matches(should_appear, obs)
+            if observation_valid:
+                observed_texts = obs
+                found, missed = self._split_matches(
+                    should_appear, obs, match_any=pred.match_any
+                )
                 if not missed:
                     break
 
@@ -209,6 +239,8 @@ class ActionPredictor:
             "missed": missed,
             "elapsed": round(elapsed, 2),
             "observation_count": observation_count,
+            "observed_texts": observed_texts,
+            "observation_valid": observation_valid,
         }
         pred.result = result
         return result
@@ -240,7 +272,9 @@ class ActionPredictor:
         obs = ocr_texts if ocr_texts is not None else self.observe()
 
         if should_appear:
-            found, missed = self._split_matches(should_appear, obs)
+            found, missed = self._split_matches(
+                should_appear, obs, match_any=pred.match_any
+            )
         else:
             found, missed = [], []
 
@@ -296,7 +330,8 @@ class ActionPredictor:
     # ============================================================
 
     def _split_matches(self, should_appear: List[str],
-                       ocr_texts: List[str]) -> Tuple[List[str], List[str]]:
+                       ocr_texts: List[str],
+                       match_any: bool = False) -> Tuple[List[str], List[str]]:
         """将应出现的元素分为已找到/未找到"""
         if not should_appear:
             return [], []
@@ -313,4 +348,10 @@ class ActionPredictor:
                 found.append(target)
             else:
                 missed.append(target)
+        if match_any and found:
+            return found, []
         return found, missed
+
+    def matched_conditions(self, conditions: List[str],
+                           ocr_texts: List[str]) -> List[str]:
+        return self._split_matches(conditions, ocr_texts)[0]

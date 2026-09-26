@@ -102,6 +102,8 @@ class AgentStateMachine:
         self.current_step = 0
         self.steps_without_progress = 0   # 连续无实质进展步数
         self.continuous_scan_count = 0    # 连续纯感知步数
+        self.consecutive_failures = 0
+        self.total_failures = 0
 
         # 工具调用历史
         self._tool_history: List[str] = []
@@ -176,6 +178,14 @@ class AgentStateMachine:
             self._tool_history.append(name)
             self._tool_count[name] += 1
 
+        if is_failure:
+            self.total_failures += 1
+
+        if has_progress:
+            self.consecutive_failures = 0
+        elif is_failure:
+            self.consecutive_failures += 1
+
         if has_progress:
             self.steps_without_progress = 0
             self.continuous_scan_count = 0
@@ -236,6 +246,7 @@ class AgentStateMachine:
             self.transition(AgentState.RUNNING, f"已切换策略恢复执行: {action_summary}")
             self.steps_without_progress = 0
             self.continuous_scan_count = 0
+            self.consecutive_failures = 0
 
     def enter_recovering(self, action_summary: str):
         """进入恢复状态：STUCK → RECOVERING"""
@@ -252,6 +263,8 @@ class AgentStateMachine:
             "max_steps": self.max_steps,
             "steps_without_progress": self.steps_without_progress,
             "continuous_scan_count": self.continuous_scan_count,
+            "consecutive_failures": self.consecutive_failures,
+            "total_failures": self.total_failures,
             "recent_tools": recent_tools,
             "tool_usage_counts": {
                 k: v for k, v in self._tool_count.most_common(8)
@@ -266,6 +279,7 @@ class AgentStateMachine:
             f"- 执行阶段: {payload['state']}",
             f"- 当前步数: {payload['current_step']}/{payload['max_steps']}",
             f"- 连续无进展步数: {payload['steps_without_progress']}",
+            f"- 连续失败步数: {payload['consecutive_failures']}",
             f"- 最近工具: {', '.join(payload['recent_tools']) or '无'}",
         ]
 
