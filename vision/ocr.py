@@ -10,6 +10,8 @@ EasyOCR 返回格式：每个元素 (bbox, text, confidence)
 import json
 import logging
 import re
+import sys
+import time
 import warnings
 from typing import Dict, Any, List, Optional
 
@@ -19,18 +21,78 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# ⚡ 抑制 EasyOCR 的 pin_memory 警告刷屏
-#   EasyOCR 每次 readtext() 会创建 DataLoader(..., pin_memory=True)，
-#   在 CPU-only 环境每次迭代都打印 "no accelerator is found" 警告。
-#   预测观察轮询时每分钟刷屏几十条，严重淹没有效日志。这里静默它。
-warnings.filterwarnings(
-    "ignore",
-    message=".*pin_memory.*argument is set as true.*",
+# ============================================================
+# 日志 / 告警兜底
+# ============================================================
+# ⚡ 1) 抑制 EasyOCR 的 pin_memory 刷屏
+#   EasyOCR 每次 readtext() 都创建 DataLoader(..., pin_memory=True)，
+#   CPU-only 环境下每条识别都会告警一次，观察轮询时刷屏几十条。
+# ⚡ 2) 兜底 print：GBK 控制台下打印 ✓/✅ 会抛 UnicodeEncodeError
+#   （曾导致本模块首次 OCR 调用直接失败）
+
+_QUIET_WARNING_PATTERNS = (
+    "pin_memory",
+    "no accelerator is found",
 )
-warnings.filterwarnings(
-    "ignore",
-    message=".*no accelerator is found.*",
-)
+
+
+def _safe_print(*args, **kwargs):
+    """永不抛 UnicodeEncodeError 的 print"""
+    try:
+        print(*args, **kwargs)
+        return
+    except UnicodeEncodeError:
+        pass
+    except Exception:
+        return
+    try:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        text = " ".join(str(a) for a in args)
+        sys.stdout.write(
+            text.encode(enc, "replace").decode(enc, "replace") + "\n"
+        )
+    except Exception:
+        pass
+
+
+_ORIGINAL_SHOWWARNING = warnings.showwarning
+
+
+def _quiet_showwarning(message, category, filename, lineno,
+                       file=None, line=None):
+    """丢弃 pin_memory 类刷屏告警，其余交回原处理器
+
+    为何不用 filterwarnings 唯一兜底：只要有库调用
+    `warnings.simplefilter()` / `resetwarnings()`，已注册规则就会被清空。
+    替换 showwarning 不会被重置，最稳。
+    """
+    text = str(message)
+    if any(p in text for p in _QUIET_WARNING_PATTERNS):
+        return
+    try:
+        _ORIGINAL_SHOWWARNING(message, category, filename, lineno,
+                              file=file, line=line)
+    except Exception:
+        pass
+
+
+def _install_quiet_warnings():
+    """安装告警静音（幂等，可重复调用）"""
+    warnings.filterwarnings(
+        "ignore",
+        message=".*pin_memory.*argument is set as true.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=".*no accelerator is found.*",
+    )
+    try:
+        warnings.showwarning = _quiet_showwarning
+    except Exception:
+        pass
+
+
+_install_quiet_warnings()
 
 # ============================================================
 # EasyOCR 单例（懒加载，常驻内存）
@@ -42,10 +104,12 @@ def _get_reader():
     """获取 EasyOCR Reader 实例（懒加载）"""
     global _reader
     if _reader is None:
-        print("  [OCR] 加载 EasyOCR（中英文）...")
+        _safe_print("  [OCR] 加载 EasyOCR（中英文）...")
         import easyocr
+        # import easyocr 可能带来其它库对 warnings 过滤器的重置，这里再装一次
+        _install_quiet_warnings()
         _reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)
-        print("  [OCR] ✓ EasyOCR 就绪")
+        _safe_print("  [OCR] [OK] EasyOCR 就绪")
     return _reader
 
 
@@ -95,15 +159,22 @@ def _ocr_image(image: Image.Image) -> List[Dict]:
 # 对外接口
 # ============================================================
 
-def ocr_screen() -> str:
-    """全屏 OCR — 识别屏幕上所有可见文字及其坐标
-    
-    使用 EasyOCR（中英文），返回所有可见文字块及坐标。
-    比 visual_scan() 更适合"找按钮/菜单/对话框上的文字"场景。
-    
-    Returns:
-        JSON: {screen, texts: [{text, x, y, w, h, cx, cy, confidence}], count}
-    """
+# ⚡ 全屏 OCR 短 TTL 缓存
+#   同一动作内的多处调用（预测观察 / 预测对比 / 阶段推进 / 验收）
+#   常常在同一瞬间重复识别同一帧（每次 CPU 2-5s）。
+#   这里做 0.8s 复用；**动作类工具执行后必须 invalidate**，保证不乱用旧帧。
+_OCR_CACHE = {"ts": 0.0, "value": ""}
+_OCR_CACHE_TTL = 0.8
+
+
+def invalidate_ocr_cache():
+    """使全屏 OCR 缓存失效（动作改变屏幕后调用）"""
+    _OCR_CACHE["ts"] = 0.0
+    _OCR_CACHE["value"] = ""
+
+
+def _ocr_screen_uncached() -> str:
+    """真正执行全屏 OCR（内部使用）"""
     try:
         screenshot = pyautogui.screenshot()
         screen_w, screen_h = pyautogui.size()
@@ -129,6 +200,44 @@ def ocr_screen() -> str:
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+def ocr_screen(use_cache: bool = True, ttl: float = None) -> str:
+    """全屏 OCR — 识别屏幕上所有可见文字及其坐标
+
+    使用 EasyOCR（中英文），返回所有可见文字块及坐标。
+    比 visual_scan() 更适合"找按钮/菜单/对话框上的文字"场景。
+
+    Args:
+        use_cache: 是否使用短 TTL 缓存（默认 True）
+        ttl: 缓存有效期秒数（默认 0.8s）
+
+    Returns:
+        JSON: {screen, texts: [{text, x, y, w, h, cx, cy, confidence}], count}
+    """
+    ttl = _OCR_CACHE_TTL if ttl is None else float(ttl)
+    if use_cache and ttl > 0:
+        age = time.time() - _OCR_CACHE["ts"]
+        if _OCR_CACHE["value"] and age < ttl:
+            return _OCR_CACHE["value"]
+
+    result_json = _ocr_screen_uncached()
+
+    if use_cache and ttl > 0:
+        _OCR_CACHE["ts"] = time.time()
+        _OCR_CACHE["value"] = result_json
+    return result_json
+
+
+def _screen_texts(use_cache: bool = True) -> List[Dict]:
+    """获取全屏文字块列表（复用 ocr_screen 缓存）"""
+    try:
+        data = json.loads(ocr_screen(use_cache=use_cache))
+        if isinstance(data, dict):
+            return data.get("texts", []) or []
+    except Exception:
+        pass
+    return []
 
 
 def ocr_region(x: int, y: int, width: int, height: int) -> str:
@@ -198,8 +307,11 @@ def find_text_on_screen(target_text: str) -> Dict[str, Any]:
          "candidates": [...], ...}
     """
     try:
-        screenshot = pyautogui.screenshot()
-        texts = _ocr_image(screenshot)
+        # 复用全屏 OCR 缓存（同一 step 内已有观察结果时不再重复识别，省 2-5s）
+        texts = _screen_texts(use_cache=True)
+        if not texts:
+            screenshot = pyautogui.screenshot()
+            texts = _ocr_image(screenshot)
 
         def _make(t, match, score_extra=0.0):
             return {"found": True, "text": t["text"], "x": t["cx"], "y": t["cy"],

@@ -27,6 +27,13 @@ def main():
     """主入口"""
     import argparse
 
+    # 控制台编码兜底（GBK 控制台下打印 ✅/✓/⚠️ 会抛 UnicodeEncodeError）
+    try:
+        from config import setup_console_encoding
+        setup_console_encoding()
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="Computer Use Agent - 桌面自动化（持续运行）")
     parser.add_argument("task", nargs="?", help="要完成的任务描述（可选，不提供则进入交互模式）")
 
