@@ -22,6 +22,11 @@
 - ✅ **领域技能**：`skills/` 提供文件整理（file）、游戏（game）、浏览器（browser）专属策略
 - ✅ **多层记忆**：运行时工作记忆 + 抽象经验存储 + 结构化日志，便于调试与长期学习
 - ✅ **工具策略**：`ToolManager` 根据任务推荐工具、记录成功率、拦截错配调用
+- ✅ **成本感知规划**：`CostModel` + `BudgetTracker` + 多方案择优（`<plans>`）——按成本选最省方案，超预算自动降级到低成本路径
+- ✅ **过期启动器重规划**：`ReplanManager` 记忆失效启动路径，同一目标连续失败即**强制重新规划**并禁用失效路径
+- ✅ **可靠键鼠输入**：`system/input_controller.py` 基于 Win32 `SendInput`（绝对定位归一化 + 前台窗口激活 + UIPI 权限预检 + 光标到位校验 + 扩展键标志 + 剪贴板安全输入），输入无效时**明确报错**而非假成功
+- ✅ **强约束执行**：**动作门卫**（阶段门控 + 禁止盲点）——越权动作被拒绝，没有定位来源的 `click_at` 被拦截，杜绝"明知不在该界面仍盲点"
+- ✅ **健壮日志**：控制台**编码兜底**（GBK 下打印 ✅/✓ 不再抛 `UnicodeEncodeError` 中断任务）+ `pin_memory` 告警静音（替换 `showwarning`，不可被重置）+ OCR **短 TTL 缓存**（同一动作内不重复全屏识别）
 
 ---
 
@@ -42,6 +47,8 @@ vision agent/
 │   ├── tools.py               # 全部工具（视觉/键鼠/PowerShell/OCR）
 │   ├── state_manager.py       # 全局状态管理器（分层世界状态+失败计数）
 │   ├── tool_manager.py        # 工具调用策略（任务→推荐工具+统计）
+│   ├── cost_planner.py        # 成本感知规划（成本模型+预算+多方案择优）
+│   ├── replan_manager.py      # 过期启动器检测 → 强制重新规划
 │   ├── task_phase.py          # 任务阶段状态机
 │   ├── verifier.py            # 独立验收器（GoalSpec + 证据匹配）
 │   ├── predictor.py           # 动作预测闭环
@@ -55,6 +62,7 @@ vision agent/
 │   ├── router.py              # 视觉任务路由器（OCR/DETECT/CLIP/SCENE）
 │   └── ocr.py                 # EasyOCR 文字识别
 ├── skills/                    # 领域技能（文件/游戏/浏览器）
+├── system/                    # 系统层（SendInput 键鼠控制器 / 窗口与进程检测）
 ├── knowledge/                 # 自愈知识库（运行时生成）
 └── logs/                      # 结构化执行日志（运行后生成）
 ```
