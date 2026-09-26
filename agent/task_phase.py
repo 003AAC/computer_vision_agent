@@ -33,6 +33,8 @@ class PhaseDefinition:
         expected_next: List[str] = None,
         verification_method: List[str] = None,
         description: str = "",
+        est_cost: float = 0.0,
+        alternatives: List[str] = None,
     ):
         """
         Args:
@@ -42,6 +44,8 @@ class PhaseDefinition:
             expected_next: 预期的下一阶段列表
             verification_method: 验证方法描述
             description: 阶段说明
+            est_cost: 该阶段预估成本（成本点，规划器给出）
+            alternatives: 该阶段的备选做法（用于规避失效路径）
         """
         self.name = name
         self.entry_conditions = entry_conditions or []
@@ -49,6 +53,8 @@ class PhaseDefinition:
         self.expected_next = expected_next or []
         self.verification_method = verification_method or []
         self.description = description
+        self.est_cost = float(est_cost or 0.0)
+        self.alternatives = alternatives or []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -58,6 +64,8 @@ class PhaseDefinition:
             "expected_next": self.expected_next,
             "verification_method": self.verification_method,
             "description": self.description,
+            "est_cost": self.est_cost,
+            "alternatives": self.alternatives,
         }
 
     @classmethod
@@ -69,6 +77,8 @@ class PhaseDefinition:
             expected_next=d.get("expected_next", []),
             verification_method=d.get("verification_method", []),
             description=d.get("description", ""),
+            est_cost=d.get("est_cost", 0.0),
+            alternatives=d.get("alternatives", []),
         )
 
 
