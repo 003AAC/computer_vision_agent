@@ -134,7 +134,7 @@ class TaskPhaseMachine:
         return phase.expected_next if phase else []
 
     def build_instruction(self) -> str:
-        """构建阶段状态指令（注入提示词）"""
+        """构建阶段状态建议（不是工具执行权限控制）"""
         phase = self._phases.get(self.current_phase)
         lines = ["## [任务阶段] 当前阶段"]
         lines.append(f"- 当前阶段: {self.current_phase}")
@@ -143,7 +143,13 @@ class TaskPhaseMachine:
         if phase and phase.expected_next:
             lines.append(f"- 预期下一阶段: {', '.join(phase.expected_next)}")
         if phase and phase.allowed_actions:
-            lines.append(f"- 本阶段允许操作: {', '.join(phase.allowed_actions[:8])}")
+            lines.append(
+                f"- 本阶段推荐操作: {', '.join(phase.allowed_actions)}"
+            )
+            lines.append(
+                "- 推荐列表仅用于规划，不是硬性限制；若完成当前任务需要点击、"
+                "输入或按键，可以调用相应工具。"
+            )
         if phase and phase.entry_conditions:
             lines.append(f"- 本阶段屏幕特征: {', '.join(phase.entry_conditions[:6])}")
         return "\n".join(lines)
@@ -247,24 +253,20 @@ class TaskPhaseMachine:
     # ============================================================
 
     def is_action_allowed(self, tool_name: str) -> bool:
-        """检查工具是否在当前阶段允许使用
+        """Return whether a tool may execute; planned actions are not a hard ACL.
 
-        若当前阶段为 EXPLORING 或未定义 allowed_actions，则全部允许。
+        allowed_actions is retained as a planning recommendation for compatibility.
         """
-        phase = self._phases.get(self.current_phase)
-        if phase is None or not phase.allowed_actions:
-            return True
-        return tool_name in phase.allowed_actions
+        return True
 
     def get_disallowed_hint(self, tool_name: str) -> str:
-        """构建工具越权提示（注入 LLM）"""
+        """Build a non-blocking recommendation hint for compatibility."""
         phase = self._phases.get(self.current_phase)
         allowed = phase.allowed_actions if phase else []
         return (
-            f"【阶段限制】当前处于 [{self.current_phase}] 阶段，"
-            f"工具 {tool_name} 不在允许列表。"
-            f"请先执行允许的操作完成本阶段，"
-            f"或使用: {', '.join(allowed[:8])}"
+            f"【阶段建议】当前处于 [{self.current_phase}] 阶段；"
+            f"{tool_name} 未列为推荐操作，但阶段列表不是硬性限制。"
+            f"若任务需要可继续使用。推荐操作: {', '.join(allowed)}"
         )
 
     # ============================================================

@@ -21,6 +21,7 @@ import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
+from agent.action_result import parse_action_result
 from systematic_error_fix.error_diagnostician import ErrorDiagnostician
 from systematic_error_fix.models import ErrorType
 from self_healer import SelfHealer
@@ -49,6 +50,7 @@ class FailureDetector:
         "失败", "错误", "异常", "超时", "未找到", "找不到",
         "not found", "error", "failed", "timeout",
         "拒绝访问", "权限", "不存在", "不是内部", "不是可识别",
+        "安全策略拒绝", "工具不存在",
         "系统找不到", "无法访问", "定位失败", "点击失败", "输入失败",
         "按键失败", "组合键失败", "拖拽失败", "命令执行失败",
         "命令执行超时", "命令执行异常",
@@ -72,7 +74,20 @@ class FailureDetector:
         Returns:
             是否为失败
         """
+        structured = parse_action_result(result_str)
+        if structured:
+            return (
+                structured.get("execution_status") == "failed"
+                or structured.get("verification_status") == "failed"
+            )
+
         result_lower = result_str.lower()
+
+        # Verification failure must take precedence over optimistic dispatch text.
+        if any(s in result_lower for s in (
+            "验证失败", "未验证", "verification failed", "not verified",
+        )):
+            return True
 
         # 成功信号优先（避免误判，如"打开失败处理成功"）
         if any(s in result_lower for s in self._success_signals):
@@ -470,34 +485,27 @@ class ExceptionHandler:
             self.failure_detector.detect(str(r)) for r in recent_tool_results
         )
 
-        # 检测是否有有效操作
-        has_success_operation = any(
-            self.is_success(str(r)) for r in recent_tool_results
-        )
-
-        confidence = 0.5
+        confidence = 0.7
         reasons = []
 
         if has_failure:
             confidence -= 0.3
             reasons.append("最近存在失败的工具调用，完成声明可疑")
         if not recent_tool_results:
-            confidence -= 0.2
-            reasons.append("没有任何工具执行记录，无法确认完成")
-        elif has_success_operation:
-            confidence += 0.3
-            reasons.append("有成功的工具操作记录")
+            reasons.append("没有最近的工具执行记录")
 
         confidence = max(0.0, min(1.0, confidence))
 
-        # 伪成功判定
-        is_pseudo_success = confidence < 0.7 and (has_failure or not recent_tool_results)
+        # Tool dispatch is not completion evidence. Objective verifiers decide
+        # whether a completion claim is supported.
+        is_pseudo_success = has_failure
 
         return {
             "is_pseudo_success": is_pseudo_success,
             "confidence": confidence,
             "reasons": reasons,
             "has_failure": has_failure,
+            "has_success_operation": False,
         }
 
     def record_heal_outcome(

@@ -50,7 +50,7 @@ class ExecutionLogger:
     def start_task(self, task: str, goal_spec: Dict[str, Any] = None):
         """任务开始，创建会话"""
         timestamp = datetime.now()
-        self._session_id = timestamp.strftime("%Y%m%d_%H%M%S")
+        self._session_id = timestamp.strftime("%Y%m%d_%H%M%S_%f")
         self._current_file = os.path.join(
             self.logs_dir, f"execution_{self._session_id}.jsonl"
         )
@@ -102,7 +102,8 @@ class ExecutionLogger:
         self._write_record(record)
 
     def log_action(self, tool_name: str, args: Dict[str, Any],
-                   result_str: str, success: bool):
+                   result_str: str, success: bool,
+                   verification_status: str = "unknown"):
         """记录单个工具调用（作为 step 的子事件）"""
         record = {
             "event": "tool_call",
@@ -111,6 +112,7 @@ class ExecutionLogger:
             "args": args,
             "result": result_str[:500],
             "success": success,
+            "verification_status": verification_status,
         }
         self._write_record(record)
 

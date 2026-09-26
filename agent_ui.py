@@ -20,7 +20,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk, scrolledtext
+from tkinter import messagebox, ttk, scrolledtext
 
 # 将项目根目录加入 sys.path（支持任意工作目录启动）
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -357,7 +357,10 @@ class AgentUI:
         sys.stdout = TextRedirector(self._log_queue, "stdout")
         sys.stderr = TextRedirector(self._log_queue, "stderr")
         try:
-            success, result = run_task(self._client, self._tools_schema, task)
+            success, result = run_task(
+                self._client, self._tools_schema, task,
+                confirm_powershell=self._confirm_powershell_command,
+            )
         except Exception as e:
             success, result = False, f"任务异常: {type(e).__name__}: {e}"
             self._safe_log(f"[致命错误] {e}", "error")
@@ -370,6 +373,26 @@ class AgentUI:
 
         # 更新 UI（主线程）
         self.root.after(0, lambda: self._on_task_finished(success, result))
+
+    def _confirm_powershell_command(self, command: str) -> bool:
+        """Ask for approval on the UI thread before a risky command executes."""
+        response = []
+        completed = threading.Event()
+
+        def ask():
+            try:
+                response.append(messagebox.askyesno(
+                    "确认高风险 PowerShell 命令",
+                    "该命令可能修改或删除数据/系统设置。\n\n"
+                    f"{command[:1500]}\n\n仍要执行吗？",
+                    parent=self.root,
+                ))
+            finally:
+                completed.set()
+
+        self.root.after(0, ask)
+        completed.wait()
+        return bool(response and response[0])
 
     def stop_task(self):
         """请求停止当前任务"""
@@ -400,16 +423,9 @@ class AgentUI:
 
 def main():
     root = tk.Tk()
-    try:
-        # Windows 原生风格 + 高 DPI
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
     app = AgentUI(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
-
