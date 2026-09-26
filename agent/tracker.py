@@ -51,6 +51,7 @@ class TrackedObject:
         confidence: float,
         screen_signature: str = "",
         source: str = "locate",
+        foreground: str = "",
     ):
         """
         Args:
@@ -59,12 +60,14 @@ class TrackedObject:
             confidence: 检测置信度
             screen_signature: 发现时的屏幕签名
             source: 来源（'locate' / 'locate_region' / 'scan'）
+            foreground: 发现时所在的前台窗口标题（用于防止跨窗口误用残留坐标）
         """
         self.key = key
         self.bbox = bbox
         self.confidence = confidence
         self.screen_signature = screen_signature
         self.source = source
+        self.foreground = foreground
         self.first_seen = time.time()
         self.last_seen = time.time()
         self.detect_count = 1
@@ -88,7 +91,7 @@ class TrackedObject:
         return self.bbox[3] - self.bbox[1]
 
     def update(self, new_bbox: List[int], new_confidence: float,
-               screen_signature: str = ""):
+               screen_signature: str = "", foreground: str = ""):
         """更新位置（平滑：50% 新位置 + 50% 旧位置）"""
         # 平滑
         smooth_bbox = [
@@ -101,6 +104,8 @@ class TrackedObject:
         self.confidence = new_confidence
         if screen_signature:
             self.screen_signature = screen_signature
+        if foreground:
+            self.foreground = foreground
         self.last_seen = time.time()
         self.detect_count += 1
 
@@ -111,6 +116,7 @@ class TrackedObject:
             "center": self.center,
             "confidence": round(self.confidence, 3),
             "source": self.source,
+            "foreground": self.foreground,
             "last_seen": self.last_seen,
             "detect_count": self.detect_count,
         }
@@ -136,8 +142,13 @@ class ObjectTracker:
     # ============================================================
 
     def track(self, key: str, bbox: List[int], confidence: float,
-              screen_signature: str = "", source: str = "locate") -> TrackedObject:
-        """记录/更新对象位置"""
+              screen_signature: str = "", source: str = "locate",
+              foreground: str = "") -> TrackedObject:
+        """记录/更新对象位置
+
+        Args:
+            foreground: 当前前台窗口标题（用于跨窗口失效判断）
+        """
         key = self._normalize_key(key)
         now = time.time()
 
@@ -146,10 +157,10 @@ class ObjectTracker:
             # 若之前的对象已失效，重新跟踪
             if obj.invalidated:
                 self._objects[key] = TrackedObject(
-                    key, bbox, confidence, screen_signature, source
+                    key, bbox, confidence, screen_signature, source, foreground
                 )
             else:
-                obj.update(bbox, confidence, screen_signature)
+                obj.update(bbox, confidence, screen_signature, foreground)
             # 更新屏幕签名记录
             self._last_screen_signature[key] = screen_signature
             return self._objects[key]
@@ -163,7 +174,8 @@ class ObjectTracker:
             )
             del self._objects[oldest_key]
 
-        obj = TrackedObject(key, bbox, confidence, screen_signature, source)
+        obj = TrackedObject(key, bbox, confidence, screen_signature,
+                            source, foreground)
         self._objects[key] = obj
         self._last_screen_signature[key] = screen_signature
         return obj
@@ -184,15 +196,20 @@ class ObjectTracker:
     # 状态判断
     # ============================================================
 
-    def should_use_cached(self, key: str, screen_signature: str = "") -> bool:
+    def should_use_cached(self, key: str, screen_signature: str = "",
+                          foreground: str = "") -> bool:
         """判断是否应优先使用缓存（在邻域进行小范围重扫）
 
         条件：
           - 对象已缓存且未失效
           - 无屏幕签名 或 签名未发生显著变化
+          - 前台窗口一致（防止"换了窗口还拿旧坐标去点"）
         """
         obj = self.get(key)
         if obj is None:
+            return False
+        # 前台窗口不一致 → 缓存坐标来自别的界面，必须重新定位
+        if foreground and obj.foreground and obj.foreground != foreground:
             return False
         if screen_signature:
             last = self._last_screen_signature.get(self._normalize_key(key), "")
@@ -200,6 +217,13 @@ class ObjectTracker:
                 # 页面变化 → 需要全屏重检
                 return False
         return True
+
+    def foreground_changed(self, key: str, foreground: str) -> bool:
+        """当前前台窗口是否与缓存记录不一致"""
+        obj = self.get(key)
+        if obj is None or not foreground:
+            return False
+        return bool(obj.foreground) and obj.foreground != foreground
 
     def screen_changed(self, key: str, screen_signature: str) -> bool:
         """检测页面是否相对上次检测发生变化"""

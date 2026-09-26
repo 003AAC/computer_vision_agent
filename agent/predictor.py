@@ -67,9 +67,9 @@ class ActionPredictor:
 
     # 等待观察轮询间隔（秒）
     POLL_INTERVAL = 0.5
-    # 最大观察次数（CPU 全屏 OCR 每次 2-5s，限制重扫次数防刷屏/拖慢）
-    # 首次观察 + 退避重扫：0.5s→1s→2s→4s→8s 覆盖约 15s 窗口
-    MAX_OBSERVATIONS = 6
+    # 最大观察次数（CPU 全屏 OCR 每次 2-5s，严格限制重扫次数）
+    # 首次观察 + 退避重扫：0.5s→1s→2s，约 3.5s 窗口（与默认 timeout=3s 匹配）
+    MAX_OBSERVATIONS = 3
     # 最大预测数量（短期内只保留最近的活动预测）
     MAX_PREDICTIONS = 3
 
@@ -182,11 +182,14 @@ class ActionPredictor:
         missed: List[str] = list(should_appear)
         elapsed = 0.0
         observation_count = 0
+        last_observation: List[str] = list(ocr_texts) if ocr_texts else []
 
         # 首次观察
         if should_appear:
             first_obs = self.observe(ocr_texts)
             observation_count += 1
+            if first_obs:
+                last_observation = first_obs
             found, missed = self._split_matches(should_appear, first_obs)
 
         # 退避重扫（最多 MAX_OBSERVATIONS 次全屏 OCR，避免 CPU 无限刷屏）
@@ -194,10 +197,11 @@ class ActionPredictor:
         while missed and time.time() < deadline \
                 and observation_count < self.MAX_OBSERVATIONS:
             time.sleep(backoff)
-            backoff = min(backoff * 2, 4.0)
+            backoff = min(backoff * 2, 2.0)
             obs = self.observe()
             observation_count += 1
             if obs:
+                last_observation = obs
                 found, missed = self._split_matches(should_appear, obs)
                 if not missed:
                     break
@@ -209,6 +213,8 @@ class ActionPredictor:
             "missed": missed,
             "elapsed": round(elapsed, 2),
             "observation_count": observation_count,
+            # ⚡ 复用：调用方无需再全屏 OCR 一次（省 2-5s）
+            "last_observation": last_observation,
         }
         pred.result = result
         return result

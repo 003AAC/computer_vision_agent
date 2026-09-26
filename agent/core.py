@@ -10,12 +10,16 @@ Agent 主循环
   - 异常处理（agent.exception_handler）：错误诊断、自愈修复、伪成功检测
 """
 import json
+import re
 import time
 from typing import Dict, Any, List, Optional
 
 from openai import OpenAI
 
-from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, MAX_STEPS
+from config import (
+    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, MAX_STEPS,
+    safe_print,
+)
 from agent.tools import ALL_TOOLS, TOOL_REGISTRY
 from agent.state_machine import AgentStateMachine, AgentState
 from agent.exception_handler import ExceptionHandler
@@ -29,6 +33,14 @@ from agent.predictor import ActionPredictor
 from agent.logger import ExecutionLogger
 from agent.experience import AbstractExperienceStore
 from agent.tool_manager import ToolManager
+from agent.cost_planner import (
+    CostModel,
+    BudgetTracker,
+    PlanCandidate,
+    select_best_plan,
+    estimate_phases_cost,
+)
+from agent.replan_manager import LaunchFailureDetector, ReplanManager
 from skills.base import build_skill_instruction, get_base_skills
 from world_state.manager import WorldStateManager
 from world_state.diff import StateDiff
@@ -84,6 +96,8 @@ def parse_planning_response(content: str) -> Dict[str, Any]:
             result["application"] = plan_data.get("application", "")
             result["initial_state"] = plan_data.get("initial_state", "")
             result["phases"] = plan_data.get("phases", [])
+            result["est_total_cost"] = plan_data.get("est_total_cost", 0)
+            result["approach"] = plan_data.get("approach", "")
         except json.JSONDecodeError:
             print("  [规划] <plan> 块解析失败，使用默认探索模式")
 
@@ -94,6 +108,16 @@ def parse_planning_response(content: str) -> Dict[str, Any]:
             result["goal_spec"] = json.loads(goal_m.group(1).strip())
         except json.JSONDecodeError:
             print("  [规划] <goal> 块解析失败，使用默认验收")
+
+    # 解析 <plans> 块（成本感知多方案择优）
+    plans_m = re.search(r'<plans>(.*?)</plans>', content, re.S | re.I)
+    if plans_m:
+        try:
+            candidates = json.loads(plans_m.group(1).strip())
+            if isinstance(candidates, list) and candidates:
+                result["plan_candidates"] = candidates
+        except json.JSONDecodeError:
+            print("  [规划] <plans> 块解析失败，使用单一方案")
 
     return result
 
@@ -107,11 +131,16 @@ def phase_from_dict(d: Dict[str, Any]) -> PhaseDefinition:
         expected_next=d.get("expected_next", []),
         verification_method=d.get("verification_method", []),
         description=d.get("description", ""),
+        est_cost=d.get("est_cost", 0.0),
+        alternatives=d.get("alternatives", []),
     )
 
 
-def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
-    """任务开始前的 Planning 调用：生成任务阶段 + 验收规格
+def plan_task(client, tools_schema, user_query: str,
+              failed_paths: List[str] = None,
+              replan_reason: str = "",
+              cost_feedback: Dict[str, Any] = None) -> Dict[str, Any]:
+    """任务开始前的 Planning 调用：生成任务阶段 + 验收规格（成本感知）
 
     这是架构升级的第一步：让 LLM 在开跑前理解任务并建立状态。
 
@@ -119,6 +148,9 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
         client: OpenAI 客户端
         tools_schema: 工具 schema（不用，纯文本规划）
         user_query: 任务描述
+        failed_paths: 已失效的启动路径/方式（重新规划时禁用，防止死磕过期启动器）
+        replan_reason: 重新规划原因（非空表示本次是 replan）
+        cost_feedback: 上一轮成本反馈 {spent, budget, over_budget}
 
     Returns:
         {
@@ -129,14 +161,34 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
           "raw": str
         }
     """
+    # ---- 重规划 / 成本反馈约束（仅在需要时非空）----
+    extra_constraint = ""
+    if replan_reason:
+        _lines = [f"## ⚠️ 本次为**重新规划**（触发原因: {replan_reason}）"]
+        if failed_paths:
+            _lines.append("以下启动方式已确认失效，**禁止再使用**：")
+            for _p in failed_paths[:10]:
+                _lines.append(f"  - {_p}")
+        _lines.append("必须为启动步骤提供至少 2 种**不在禁用清单内**的备选方式。")
+        _lines.append("禁止原样重复上一版计划。")
+        extra_constraint += "\n".join(_lines) + "\n\n"
+    if cost_feedback and cost_feedback.get("over_budget"):
+        extra_constraint += (
+            "## 💰 成本反馈：上一轮已超预算"
+            f"（已用 {float(cost_feedback.get('spent', 0)):.1f} / "
+            f"预算 {float(cost_feedback.get('budget', 0)):.1f} 成本点）。\n"
+            "本轮必须显著降低预计成本：优先单条 run_powershell 直达，"
+            "减少全屏扫描/全屏OCR阶段，减少阶段数。\n\n"
+        )
+
     planning_prompt = f"""你是一个Windows桌面自动化的**任务规划器**。在 Agent 开始执行前，你负责生成任务的结构化规划。
 
 ## 任务
 {user_query}
 
-## 输出格式（严格遵循）
+{extra_constraint}## 输出格式（严格遵循）
 
-请用以下两个块输出规划：
+请用以下块输出规划：
 
 <plan>
 {{
@@ -148,9 +200,12 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
       "entry_conditions": ["该阶段屏幕应出现的文字/元素关键词"],
       "allowed_actions": ["该阶段允许的工具名"],
       "expected_next": ["预期下一阶段名"],
-      "verification_method": ["如何验证当前处于此阶段"]
+      "verification_method": ["如何验证当前处于此阶段"],
+      "est_cost": 3,
+      "alternatives": ["该阶段若有多种做法，列出备选方法"]
     }}
-  ]
+  ],
+  "est_total_cost": 12
 }}
 </plan>
 
@@ -162,6 +217,13 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
 }}
 </goal>
 
+<plans>
+[
+  {{"name": "方案A（名称）", "approach": "一句话做法", "est_total_cost": 10, "risk": "low", "rationale": "为什么选它（步骤越少越好）"}},
+  {{"name": "方案B", "approach": "...", "est_total_cost": 18, "risk": "medium", "rationale": "..."}}
+]
+</plans>
+
 ## 要求
 1. phases 覆盖任务的主要阶段（3-6 个），从初始状态到完成。
 2. entry_conditions 是**屏幕真实会出现的文字**（如 "开始游戏"、"Play"、"单人游戏"、"确定"、应用标题栏文字），
@@ -170,7 +232,11 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
 3. allowed_actions 从这些工具中选择：visual_scan, visual_scan_region, visual_scan_grid, visual_locate, visual_locate_region, visual_read_text, visual_read_region, visual_find_text, click_at, drag_mouse, type_text, press_key, hotkey, run_powershell, wait
 4. goal-spec 的 evidence 是可独立验证的**屏幕特征**（用于验收，禁止依赖执行过程）。
    evidence 同样必须是**屏幕真实文字**（如 "开始游戏"、"Play"、游戏标题文字），禁止抽象描述。
-5. 只输出 <plan> 和 <goal> 块，不要其他解释文字。
+5. **成本感知**：为每阶段给出 est_cost（预估调用次数，越小越省），并给出 est_total_cost。
+6. **多方案**：<plans> 给出 2-3 个候选方案并各自估成本；系统会选择"成本最低且可行"的方案执行。
+   优先低成本路径（一条 run_powershell 直达 > 多步截图定位点击）。
+   **禁止**把"反复点同一目标"当方案；若某启动方式已在其失败清单中，必须换方式。
+7. 只输出 <plan>、<goal>、<plans> 块，不要其他解释文字。
 """
 
     try:
@@ -196,11 +262,63 @@ def plan_task(client, tools_schema, user_query: str) -> Dict[str, Any]:
         parsed["phases"] = phases
         parsed["raw"] = content
 
+        # ---- 成本感知择优：从 <plans> 候选中选"成本最低且可行"的方案 ----
+        try:
+            raw_candidates = parsed.get("plan_candidates") or []
+            if raw_candidates:
+                candidates = []
+                for c in raw_candidates:
+                    if not isinstance(c, dict):
+                        continue
+                    c_phases = []
+                    for pd in (c.get("phases") or []):
+                        try:
+                            c_phases.append(phase_from_dict(pd))
+                        except Exception:
+                            pass
+                    est = c.get("est_total_cost", 0) or 0
+                    try:
+                        est = float(est)
+                    except (TypeError, ValueError):
+                        est = 0.0
+                    if est <= 0:
+                        est = estimate_phases_cost(c_phases)
+                    candidates.append(PlanCandidate(
+                        name=c.get("name", "候选方案"),
+                        approach=c.get("approach", ""),
+                        est_total_cost=est,
+                        risk=str(c.get("risk", "medium")).lower(),
+                        phases=c_phases,
+                        rationale=c.get("rationale", ""),
+                    ))
+                best = select_best_plan(candidates, failed_paths=failed_paths)
+                if best is not None:
+                    print(f"  [规划|成本] 候选 {len(candidates)} 个，"
+                          f"选中 [{best.name}] est_cost={best.est_total_cost}")
+                    for c in candidates:
+                        print(f"    - {c.name}: cost={c.est_total_cost} "
+                              f"risk={c.risk}")
+                    if best.phases:
+                        phases = best.phases
+                        parsed["phases"] = phases
+                    parsed["selected_plan"] = best.to_dict()
+                    if best.est_total_cost > 0:
+                        parsed["est_total_cost"] = best.est_total_cost
+        except Exception as e:
+            print(f"  [规划|成本] 择优跳过: {e}")
+
+        # 补齐成本：规划未给 est_total_cost 时按阶段估算
+        if not parsed.get("est_total_cost"):
+            parsed["est_total_cost"] = estimate_phases_cost(
+                parsed.get("phases", [])
+            )
+
         # 校验：至少应有阶段或 goal
         if phases or parsed.get("goal_spec"):
             print("  [规划] ✅ 任务规划生成成功")
             print(f"    - 应用: {parsed.get('application', '未知')}")
             print(f"    - 阶段数: {len(phases)}")
+            print(f"    - 预估总成本: {parsed.get('est_total_cost')} 成本点")
             if parsed.get("goal_spec"):
                 gs = parsed["goal_spec"]
                 print(f"    - 目标: {gs.get('goal', '')} | 证据: {len(gs.get('evidence', []))}条")
@@ -345,6 +463,24 @@ visual_find_text("确定") 返回：
 如果未提供 <predict>，系统将使用任务阶段机定义的预期作为兜底。
 """
 
+    # ⛔ 禁止盲点：硬约束（配合 core.py 的动作门卫，双保险）
+    base_prompt += """
+## ⛔ 禁止盲点（强制约束）
+1. **没有坐标来源就绝不点击**：可用于 `click_at` 的坐标只允许来自
+   `visual_find_text` / `visual_locate` / `visual_locate_region` /
+   `visual_read_text` / `visual_read_region`（或视觉对象缓存命中）。
+   凭猜测、凭记忆、"大概在那个位置"的坐标会被系统**直接拦截**，
+   并返回"点击失败: 禁止盲点"。
+2. **遵守当前任务阶段**：系统按 [任务阶段] 的 allowed_actions 拦截越权动作。
+   若动作被拒绝，请阅读拒绝原因并改用本阶段允许的操作，
+   **不要换个坐标继续点同一个东西**。
+3. **先确认、再动作**：无法通过 OCR/视觉确认目标存在时，禁止"试探性点击"；
+   应继续观察（换区域/换工具）或改用 `run_powershell` 直达。
+4. **假点击会判失败**：若点击后界面毫无变化，或**同一坐标重复点击仍无变化**，
+   系统会返回"点击失败: …假点击…"。此时**禁止原样重试**，
+   必须先重新观察（确认目标是否还存在/界面是否已变），再换坐标或换方式。
+"""
+
     return base_prompt
 
 
@@ -383,6 +519,98 @@ def _extract_ocr_texts(result_str: str) -> List[str]:
         # 非 JSON（如 visual_find_text 的文本返回）
         pass
     return texts
+
+
+# ============================================================
+# ⚡ 动作门卫（P3）：阶段门控 + 禁止盲点
+# ============================================================
+# 仅对"会改变界面状态"的 UI 动作生效；run_powershell 作为逃生通道不拦截
+GUARDED_ACTION_TOOLS = {
+    "click_at", "drag_mouse", "type_text", "press_key", "hotkey",
+}
+# 坐标来源识别（从工具结果中提取真实坐标）
+_COORD_PATTERNS = (
+    re.compile(r"坐标\(\s*(\d+)\s*,\s*(\d+)\s*\)"),
+    re.compile(r'"cx"\s*:\s*(\d+)\s*,\s*"cy"\s*:\s*(\d+)'),
+)
+_COORD_TOLERANCE = 12
+_COORD_WINDOW_STEPS = 3
+
+
+def _collect_coordinates(result_str: str, sink: set) -> None:
+    """从工具结果中提取真实坐标（供"禁止盲点"门卫校验）"""
+    if not result_str or sink is None:
+        return
+    text = str(result_str)
+    for pat in _COORD_PATTERNS:
+        for m in pat.finditer(text):
+            try:
+                sink.add((int(m.group(1)), int(m.group(2))))
+            except (TypeError, ValueError):
+                continue
+    while len(sink) > 400:          # 防止无限增长
+        sink.pop()
+
+
+def _recent_known_coords(coord_history: List[set], step: int,
+                         window: int = _COORD_WINDOW_STEPS) -> set:
+    """最近 window 步内获得的坐标集合"""
+    merged: set = set()
+    if not coord_history:
+        return merged
+    start = max(0, step - window)
+    for i in range(start, min(step, len(coord_history))):
+        merged |= coord_history[i]
+    return merged
+
+
+def _is_known_coordinate(x: int, y: int, known: set) -> bool:
+    """坐标是否来自真实定位结果（容差内匹配）"""
+    for (kx, ky) in known:
+        if abs(kx - x) <= _COORD_TOLERANCE and abs(ky - y) <= _COORD_TOLERANCE:
+            return True
+    return False
+
+
+def _action_guard(tool_name: str, tool_args: Dict[str, Any],
+                  task_phase: TaskPhaseMachine, known_coords: set) -> str:
+    """动作执行前门卫：返回非空字符串 = 拒绝执行（内容为拒绝原因）
+
+    规则：
+      1. 阶段门控：阶段机定义了 allowed_actions 且本工具不在其中 → 拒绝
+      2. 禁止盲点：click_at 坐标必须来自最近几步的真实定位/OCR 结果
+
+    失败开放（fail-open）：任何内部异常都不拦截，避免误伤正常流程。
+    """
+    try:
+        # 规则 1：阶段门控（让"计划"真正约束"动作"）
+        if tool_name in GUARDED_ACTION_TOOLS and task_phase is not None:
+            if not task_phase.is_action_allowed(tool_name):
+                return (
+                    f"动作被拒绝: {task_phase.get_disallowed_hint(tool_name)}\n"
+                    f"当前阶段为 [{task_phase.current_phase}]，"
+                    f"请先完成该阶段目标，或改用本阶段允许的操作。"
+                )
+
+        # 规则 2：禁止盲点（click_at 必须有坐标来源）
+        if tool_name == "click_at":
+            raw_x = tool_args.get("x")
+            raw_y = tool_args.get("y")
+            try:
+                x, y = int(raw_x), int(raw_y)
+            except (TypeError, ValueError):
+                return (f"点击失败: 坐标缺失或非法 (x={raw_x!r}, y={raw_y!r})，"
+                        f"禁止盲点。")
+            if not _is_known_coordinate(x, y, known_coords):
+                return (
+                    f"点击失败: 坐标 ({x}, {y}) 没有任何定位来源 —— 禁止盲点。\n"
+                    f"请先调用 visual_find_text(\"目标文字\") / visual_locate() / "
+                    f"visual_read_region() 取得真实坐标，再点击该坐标；"
+                    f"若无法确认目标存在，请继续观察或更换方案。"
+                )
+    except Exception:
+        return ""
+    return ""
 
 
 def _parse_predict_block(content: str) -> Dict[str, Any]:
@@ -538,7 +766,8 @@ def _run_prediction_closure(
     wait_result = None
     if should_appear:
         wait_result = predictor.wait_and_observe(pred)
-        observed_texts = predictor.observe()
+        # ⚡ 复用 wait_and_observe 的末次观察结果，避免再全屏 OCR 一次（省 2-5s）
+        observed_texts = wait_result.get("last_observation") or []
         print(f"  [观察] 匹配={wait_result.get('found', [])} "
               f"未匹配={wait_result.get('missed', [])} "
               f"耗时={wait_result.get('elapsed', 0)}s")
@@ -550,8 +779,12 @@ def _run_prediction_closure(
         }
         observed_texts = []
 
-    # 对比预测 vs 观察（含阶段匹配）
-    compare_result = predictor.compare(pred, observed_phase=task_phase.current_phase)
+    # 对比预测 vs 观察（复用已观察文本，避免又一次全屏 OCR）
+    compare_result = predictor.compare(
+        pred,
+        observed_phase=task_phase.current_phase,
+        ocr_texts=(observed_texts or None),
+    )
     classification = predictor.classify_failure(compare_result, tool_name)
 
     # 更新工作记忆
@@ -591,12 +824,26 @@ def run_task(client, tools_schema, user_query: str):
     world_mgr = WorldStateManager()          # 世界状态理解模块
     world_before_dict = None                 # 状态 diff 快照
     ws_verifier = WorldStateVerifier()       # 世界状态驱动验收器
+    budget = BudgetTracker()                 # 成本预算追踪（成本感知规划）
+    replan_mgr = ReplanManager(              # 过期启动器 → 强制重新规划
+        threshold=2, max_replans=2
+    )
 
     # 关联工作记忆到异常处理器（供快照）
     exception_handler.working_memory = working_memory
 
     # 执行轨迹（供任务结束经验提取）
     execution_trace = []
+
+    # ⚡ 动作门卫：坐标来源历史（按 step 分桶，仅保留最近若干步）
+    coord_history: List[set] = []
+
+    # ⚡ 假点击检测：重置点击状态（避免上一个任务的点击记录干扰本任务）
+    try:
+        from agent.tools import reset_fake_click_state
+        reset_fake_click_state()
+    except Exception:
+        pass
 
     # 尝试接入知识库（自愈经验沉淀）
     try:
@@ -637,6 +884,18 @@ def run_task(client, tools_schema, user_query: str):
     if goal_spec_dict:
         verifier.set_spec_from_dict(goal_spec_dict)
         print(f"  [验收] 已设置独立验收规格: {goal_spec_dict.get('goal', '')}")
+
+    # ⚡ 成本感知：用计划成本设定执行预算
+    try:
+        planned_cost = plan_result.get("est_total_cost", 0) or 0
+        budget.set_from_plan(planned_cost)
+        print(f"  [成本预算] 计划成本 {planned_cost} → 预算 {budget.budget:.1f} 成本点")
+        if plan_result.get("selected_plan"):
+            sp = plan_result["selected_plan"]
+            print(f"  [成本预算] 采用方案: {sp.get('name')} "
+                  f"(cost={sp.get('est_total_cost')}, risk={sp.get('risk')})")
+    except Exception as e:
+        print(f"  [成本预算] 初始化跳过: {e}")
 
     # ⚡ WorldState: 创建任务世界状态
     try:
@@ -700,6 +959,22 @@ def run_task(client, tools_schema, user_query: str):
     except Exception as e:
         print(f"  [技能] 技能注入跳过: {e}")
 
+    # ⚡ 重规划：注入已知失效路径清单（跨任务失效记忆，防止死磕过期启动器）
+    try:
+        _known_failed = replan_mgr.failed_paths()
+        if _known_failed:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "【失效路径记忆】以下启动方式历史上已确认失效，"
+                    "**禁止再使用**，必须换用其他方式启动：\n  - "
+                    + "\n  - ".join(_known_failed[:10])
+                ),
+            })
+            print(f"  [重规划] 已注入失效路径记忆 {len(_known_failed)} 条")
+    except Exception as e:
+        print(f"  [重规划] 失效路径注入跳过: {e}")
+
     # ⚡ WorldState: 注入初始世界状态摘要（messages 已定义）
     try:
         ws_summary = world_mgr.to_summary()
@@ -717,6 +992,11 @@ def run_task(client, tools_schema, user_query: str):
 
     for step in range(1, MAX_STEPS + 1):
         steps_taken = step
+
+        # ⚡ 动作门卫：准备当前 step 的坐标桶（供"禁止盲点"校验）
+        if len(coord_history) < step:
+            coord_history.append(set())
+        current_coords = coord_history[step - 1]
 
         # ============================================================
         # 每轮前：状态注入提醒（卡住/恢复/无进展）
@@ -741,9 +1021,14 @@ def run_task(client, tools_schema, user_query: str):
             messages.append({
                 "role": "system",
                 "content": (
-                    "【警告】你已经连续多步没有实质进展。"
-                    "请立即执行操作（click_at / type_text / press_key），"
-                    "或使用 visual_find_text() 定位目标。"
+                    "【警告】你已经连续多步没有实质进展。\n"
+                    "**不要盲目点击。** 请按顺序确认后再动作：\n"
+                    "  1. 用 visual_find_text(\"屏幕上的真实文字\") 或 visual_read_region() "
+                    "确认目标**确实存在**并取得坐标；\n"
+                    "  2. 对照 [任务阶段] 判断当前屏幕处于计划的哪个阶段；\n"
+                    "  3. 再执行与该阶段匹配的操作（点击**已获得坐标**的目标，"
+                    "或改用 run_powershell 直达）。\n"
+                    "  若无法确认目标存在 → 禁止点击，改为继续观察或更换方案。"
                 ),
             })
 
@@ -762,6 +1047,19 @@ def run_task(client, tools_schema, user_query: str):
         if state_inject:
             msg_content = "\n\n".join(state_inject)
             messages.append({"role": "system", "content": msg_content})
+
+        # ⚡ 成本感知：注入成本预算状态 + 超预算降级指令
+        try:
+            if budget.over_budget():
+                hint = budget.take_downgrade_hint()
+                if hint:
+                    messages.append({"role": "system", "content": hint})
+                    print("  [成本] ⚠️ 已超预算，注入降级指令")
+            elif budget.should_warn():
+                messages.append({"role": "system",
+                                 "content": budget.build_instruction()})
+        except Exception as e:
+            print(f"  [成本] 注入跳过: {e}")
 
         # ============================================================
         # API 调用（带异常兜底：BadRequest / 网络错误 / 超时）
@@ -799,6 +1097,16 @@ def run_task(client, tools_schema, user_query: str):
             has_step_failure = False
             has_step_progress = has_action
             pending_fix_instructions = []  # 修复指令延迟注入，保证 assistant→tool 协议顺序
+            # ⚙ 观察串行化：一次 step 只允许一种观察工具
+            #   观察类 = 扫描/定位 + OCR 读取（所有"只看不做"的工具）
+            #   规则：本步已观察 -> 跳过后续观察；动作执行后 / 工具报错后 -> 解锁观察
+            observation_tools = {
+                "visual_scan", "visual_scan_region", "visual_scan_grid",
+                "visual_locate", "visual_locate_region",
+                "visual_read_text", "visual_read_region", "visual_find_text",
+            }
+            observation_done = False        # 本 step 是否已完成一次观察
+            last_observation_tool = ""      # 已执行的观察工具名（用于提示）
 
             for tc in msg.tool_calls:
                 tool_name = tc.function.name
@@ -807,25 +1115,89 @@ def run_task(client, tools_schema, user_query: str):
                 except json.JSONDecodeError:
                     tool_args = {}
 
+                # ⚙ 观察串行化拦截：本步已观察过 -> 跳过后续观察工具
+                #   仍需写入 tool 响应（OpenAI 协议要求每个 tool_call_id 必须响应）
+                if tool_name in observation_tools and observation_done:
+                    skip_msg = (
+                        f"⏸ 已跳过观察工具 {tool_name}：本次 step 已完成一次观察"
+                        f"（{last_observation_tool}）。\n"
+                        f"请基于上一条观察结果直接决定下一步动作"
+                        f"（click_at / type_text / press_key / hotkey / run_powershell），"
+                        f"或需要新观察时等待下一轮。"
+                    )
+                    print(f"[Step {step}|观察串行] ⏸ 跳过 {tool_name}"
+                          f"（本步已完成 {last_observation_tool} 观察）")
+                    tool_names_in_step.append(tool_name)
+                    messages.append({"role": "tool", "tool_call_id": tc.id,
+                                     "content": skip_msg})
+                    recent_tool_results.append(skip_msg)
+                    continue
                 tier_label = {1: "T1-多模态", 2: "T2-PowerShell"}
                 print(f"[Step {step}|{tier_label.get(current_tier, '?')}] "
                       f"{tool_name}({json.dumps(tool_args, ensure_ascii=False)})")
 
-                tool_result = "未知工具"
-                for t in ALL_TOOLS:
-                    if t.name == tool_name:
-                        tool_result = t.invoke(tool_args)
-                        break
+                # ============================================================
+                # ⚡ 动作门卫（阶段门控 + 禁止盲点）：不合法则拒绝执行
+                # ============================================================
+                guard_reject = _action_guard(
+                    tool_name, tool_args, task_phase,
+                    _recent_known_coords(coord_history, step),
+                )
+                if guard_reject:
+                    print(f"  [门卫] 拦截 {tool_name}")
+                    tool_result = guard_reject
                 else:
-                    # 工具不在 ALL_TOOLS，尝试注册表
-                    if tool_name in TOOL_REGISTRY:
-                        tool_result = TOOL_REGISTRY[tool_name].invoke(tool_args)
+                    tool_result = "未知工具"
+                    for t in ALL_TOOLS:
+                        if t.name == tool_name:
+                            tool_result = t.invoke(tool_args)
+                            break
+                    else:
+                        # 工具不在 ALL_TOOLS，尝试注册表
+                        if tool_name in TOOL_REGISTRY:
+                            tool_result = TOOL_REGISTRY[tool_name].invoke(tool_args)
 
                 all_tools_used.append(tool_name)
                 tool_names_in_step.append(tool_name)
                 result_str = str(tool_result)
+
+                # ⚡ 动作门卫：登记本次结果里的真实坐标（供后续点击校验）
+                try:
+                    _collect_coordinates(result_str, current_coords)
+                except Exception:
+                    pass
+
+                # ⚡ 成本感知：据此工具调用记账
+                try:
+                    budget.add_tool(tool_name, tool_args)
+                except Exception:
+                    pass
                 display = result_str[:200] + "..." if len(result_str) > 200 else result_str
-                print(f"  <- {display}")
+                safe_print(f"  <- {display}")
+                # ⚙ 动作类工具会改变屏幕 → 让全屏 OCR 缓存立即失效
+                if tool_name in action_tools:
+                    try:
+                        from vision.ocr import invalidate_ocr_cache
+                        invalidate_ocr_cache()
+                    except Exception:
+                        pass
+                # ⚙ 观察串行化：更新观察标志
+                #   观察工具 -> 锁定（本步后续观察被跳过）
+                #   动作工具 -> 解锁（动作后可重新观察）
+                if tool_name in observation_tools:
+                    observation_done = True
+                    last_observation_tool = tool_name
+                    # ⚡ 全屏观察刷新了整屏信息 → 更早的坐标视为过期，
+                    #   避免点击"按钮曾经所在的位置"（假点击的常见来源）
+                    if tool_name in ("visual_read_text", "visual_scan",
+                                     "visual_scan_grid"):
+                        try:
+                            for _i in range(step - 1):
+                                coord_history[_i] = set()
+                        except Exception:
+                            pass
+                elif tool_name in action_tools:
+                    observation_done = False
 
                 # ⚡ 结构化日志：记录工具调用明细（此前缺失，导致 JSONL 无执行轨迹）
                 try:
@@ -843,15 +1215,24 @@ def run_task(client, tools_schema, user_query: str):
                     tool_name, tool_args,
                     llm_content=msg.content or "",
                 )
+                prediction_mismatch = False
                 if prediction_ctx.get("prediction_made"):
                     exec_logger.log_prediction(prediction_ctx.get("prediction", {}))
                     if prediction_ctx.get("classification", "ok") != "ok":
-                        # 预测失败 → 注入提醒给 LLM（但当前轮不能打断协议序列，延迟注入）
+                        # 预测失败（动作"✅"但预期结果未出现）→ 属于事实上的假成功：
+                        #   1) 记为失败，让异常处理/降级/重规划真正介入
+                        #   2) 不再算作"实质进展"
                         classification = prediction_ctx.get("classification")
+                        prediction_mismatch = True
+                        has_step_progress = False
                         pending_fix_instructions.append(
-                            f"【预测验证】动作 {tool_name} 后的预期未出现 "
-                            f"(分类: {classification})。"
-                            f"请观察当前屏幕状态，判断是否需要重试、关闭弹窗或换方案。"
+                            f"【预测验证】动作 {tool_name} 已执行但预期结果未出现 "
+                            f"(分类: {classification})，本次动作视为**未生效**。\n"
+                            f"请不要原样重试同一动作："
+                            f"先重新观察屏幕（visual_find_text / visual_read_region），"
+                            f"确认目标是否存在、界面是否变化；"
+                            f"再决定换坐标、换方式（press_key/hotkey/run_powershell）"
+                            f"或关闭遮挡窗口。"
                         )
 
                 # ⚡ 视觉对象记忆：点击动作失效被点击目标
@@ -868,11 +1249,13 @@ def run_task(client, tools_schema, user_query: str):
                     "is_failure": not exception_handler.is_success(result_str),
                 })
 
-                # 失败检测（统一失败检测器）
-                is_failure = not exception_handler.is_success(result_str)
+                # 失败检测（统一失败检测器 + 预测不匹配 = 事实上的假成功）
+                is_failure = ((not exception_handler.is_success(result_str))
+                              or prediction_mismatch)
                 if is_failure:
                     has_step_failure = True
                     tier_failures += 1
+                    observation_done = False   # ⚙ 报错后允许重新观察
                     # ⚡ StateManager: 记录失败/重试计数
                     if hasattr(working_memory, 'record_failure'):
                         working_memory.record_failure()
@@ -891,10 +1274,27 @@ def run_task(client, tools_schema, user_query: str):
 
                     if failure_report["should_degrade"]:
                         print(f"  [智能降级建议] {failure_report['degrade_suggestion']}")
+
+                    # ⚡ 过期启动器检测：启动类失败 → 记录失效路径（供重新规划）
+                    try:
+                        if LaunchFailureDetector.is_launch_failure(
+                                tool_name, tool_args, result_str):
+                            _tgt = LaunchFailureDetector.extract_target(
+                                tool_name, tool_args, result_str)
+                            if _tgt:
+                                _cnt = replan_mgr.record_launch_failure(
+                                    _tgt, reason=str(result_str)[:120],
+                                    tool_name=tool_name)
+                                print(f"  [过期启动器] 记录失效目标: {_tgt} "
+                                      f"（连续 {_cnt} 次）")
+                    except Exception as e:
+                        print(f"  [过期启动器] 检测跳过: {e}")
                 else:
                     # ⚡ StateManager: 记录成功（重置失败/重试计数）
                     if hasattr(working_memory, 'record_success'):
                         working_memory.record_success()
+                    # ⚡ 重规划：成功 → 重置连续失败计数
+                    replan_mgr.record_success()
                     if tier_failures > 0:
                         tier_failures = 0
                         print(f"  [OK] 成功，重置失败计数")
@@ -1000,6 +1400,61 @@ def run_task(client, tools_schema, user_query: str):
                     success = False
                     final_result = "任务失败：Tier 1 和 Tier 2 均无法完成"
                     break
+
+            # ============================================================
+            # ⚡ 强制重新规划：过期启动器连续失败 → 调整计划（而非继续死磕）
+            # ============================================================
+            try:
+                replan_reason = replan_mgr.should_replan()
+                if replan_reason:
+                    print(f"\n  [重规划] ⚡ 触发: {replan_reason}")
+                    _failed = replan_mgr.failed_paths()
+                    new_plan = plan_task(
+                        client, tools_schema, user_query,
+                        failed_paths=_failed,
+                        replan_reason=replan_reason,
+                        cost_feedback=budget.get_statistics(),
+                    )
+                    # 应用新阶段机
+                    if new_plan.get("phases"):
+                        task_phase = TaskPhaseMachine(
+                            phases=new_plan["phases"],
+                            start_phase=(new_plan.get("initial_state")
+                                         or task_phase.current_phase),
+                        )
+                        print(f"  [重规划] 新计划阶段数: "
+                              f"{len(new_plan['phases'])}")
+                    # 应用新验收规格
+                    if new_plan.get("goal_spec"):
+                        verifier.set_spec_from_dict(new_plan["goal_spec"])
+                    # 按新计划重设预算（含成本反馈约束）
+                    budget.set_from_plan(
+                        new_plan.get("est_total_cost", 0) or 0
+                    )
+                    budget.reset_hint()
+                    replan_mgr.mark_replanned()
+                    state_machine.recover("重新规划")
+                    tier_failures = 0
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "【重新规划】原计划已失效，"
+                            f"原因: {replan_reason}\n"
+                            "已切换为新计划执行。"
+                            "失效的启动方式**禁止再用**，请严格按新阶段推进。"
+                        ),
+                    })
+                    try:
+                        exec_logger.log_info(
+                            "replanned",
+                            reason=replan_reason,
+                            failed_paths=_failed,
+                            stats=replan_mgr.get_statistics(),
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"  [重规划] 跳过（不影响执行）: {e}")
 
         else:
             # ============================================================
@@ -1154,8 +1609,11 @@ def run_task(client, tools_schema, user_query: str):
             if step > 3:
                 messages.append({
                     "role": "system",
-                    "content": "你还没有调用任何工具或调用都是视觉扫描。"
-                               "请使用 visual_find_text() 或直接根据已有信息调用 click_at() 执行操作。"
+                    "content": "你还没有调用任何工具，或只做了视觉扫描。"
+                               "请先确认屏幕上的**真实文字/元素**，再决定动作："
+                               "优先用 visual_find_text(\"真实文字\") 取得坐标后再 click_at。"
+                               "**没有定位来源时禁止点击**"
+                               "（系统会拦截无来源坐标；此时应先观察或改用 run_powershell）。"
                 })
 
     # ============================================================
@@ -1214,6 +1672,8 @@ def run_task(client, tools_schema, user_query: str):
                 "tools": sorted(set(all_tools_used)),
                 "prediction_count": len(predictor._active) if hasattr(predictor, '_active') else 0,
                 "tracked_objects": len(tracker._objects) if hasattr(tracker, '_objects') else 0,
+                "cost": budget.get_statistics(),
+                "replan": replan_mgr.get_statistics(),
             },
         )
         print(f"  [日志] 执行日志已保存")
@@ -1253,6 +1713,14 @@ def run_task(client, tools_schema, user_query: str):
     exc_stats = exception_handler.get_statistics()
     print(f"异常处理: 共 {exc_stats['total_errors']} 次错误, "
           f"类型={exc_stats['error_types']}")
+    # 成本 + 重规划统计（成本感知规划 / 过期启动器）
+    _cost = budget.get_statistics()
+    print(f"成本: 已用 {_cost['spent']} / 预算 {_cost['budget']} 成本点 "
+          f"（计划 {_cost['planned_cost']}，超预算={_cost['over_budget']}）")
+    _rp = replan_mgr.get_statistics()
+    if _rp["replan_count"] or _rp["failed_paths"]:
+        print(f"重规划: {_rp['replan_count']} 次, "
+              f"失效路径 {len(_rp['failed_paths'])} 条")
     if verifier.get_verify_history():
         print(f"独立验收: 共 {len(verifier.get_verify_history())} 次验证")
     print(f"{'=' * 60}\n")
@@ -1277,9 +1745,29 @@ def run_agent(user_query: str = None):
     try:
         from vision.ocr import ocr_screen
         import json; json.loads(ocr_screen())
-        print("  [OCR] ✓ 预热完成")
+        safe_print("  [OCR] [OK] 预热完成")
     except Exception as e:
-        print(f"  [OCR] 预热跳过: {e}")
+        safe_print(f"  [OCR] 预热跳过: {e}")
+
+    # ============================================================
+    # 输入环境自检（键鼠模拟可用性）——避免"输入无效却无提示"
+    # ============================================================
+    try:
+        from system.input_controller import describe_environment
+        env = describe_environment()
+        vs = env.get("virtual_screen", {})
+        print(f"  [输入] DPI感知={env.get('dpi_aware')} "
+              f"屏幕={vs.get('width')}x{vs.get('height')} "
+              f"光标={env.get('cursor')}")
+        if not env.get("self_elevated"):
+            safe_print("  [输入] [注意] 当前以普通权限运行：")
+            safe_print("         - 若目标窗口是管理员权限（安装程序/UAC 窗口），")
+            safe_print("           Windows(UIPI) 会丢弃模拟键鼠输入（表现为'点了没反应'）")
+            safe_print("         - 需要操作此类窗口时，请以【管理员身份】运行本程序")
+        else:
+            safe_print("  [输入] [OK] 已提权，可操作管理员窗口")
+    except Exception as e:
+        print(f"  [输入] 自检跳过: {e}")
 
     # 初始化 DeepSeek 客户端
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
